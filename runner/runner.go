@@ -285,8 +285,10 @@ func (r *Runner) compactAfterInvocation(ctx context.Context, storedSession sessi
 	return nil
 }
 
-// compactionRuntime returns the runtime that prompt assembly reads compaction
-// config from, or nil when compaction is disabled for this runner.
+// compactionRuntime returns the runtime that the request processors read off
+// the context, both to gate prompt assembly on compaction being configured and
+// to run intra-invocation compaction. It is nil when compaction is disabled for
+// this runner.
 func (r *Runner) compactionRuntime() *compactionctx.Runtime {
 	if r.compactionConfig == nil {
 		return nil

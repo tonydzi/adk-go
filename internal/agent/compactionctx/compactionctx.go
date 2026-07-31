@@ -25,6 +25,7 @@ package compactionctx
 import (
 	"context"
 
+	"google.golang.org/adk/v2/internal/compactioninternal"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/session/compaction"
 )
@@ -47,6 +48,11 @@ type Runtime struct {
 // primitive, available even to an application that never enabled compaction.
 func (rt *Runtime) Configured() bool {
 	return rt != nil && rt.Config != nil
+}
+
+// Enabled reports whether rt can actually run a tail-retention compaction.
+func (rt *Runtime) Enabled() bool {
+	return rt != nil && rt.SessionService != nil && compactioninternal.HasTailRetention(rt.Config)
 }
 
 // ToContext returns a context carrying rt.

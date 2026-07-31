@@ -362,3 +362,72 @@ func TestCompactionSpanRecordsGenAISystem(t *testing.T) {
 		})
 	}
 }
+
+func TestTailRetentionEmitsSpan(t *testing.T) {
+	exp := spanRecorder(t)
+
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"),
+		withUsage(modelTextEvent("b", "inv1", 2, "a1"), 900),
+	}
+	cfg := &compaction.Config{TokenThreshold: 100, EventRetentionSize: 0, Summarizer: &fakeSummarizer{summary: "sum"}}
+
+	if _, err := TailRetention(context.Background(), cfg, &staticSession{events: events}, nil); err != nil {
+		t.Fatalf("TailRetention() error = %v", err)
+	}
+
+	spans := exp.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if want := "compact_events token_threshold"; spans[0].Name != want {
+		t.Errorf("span name = %q, want %q", spans[0].Name, want)
+	}
+	a := attrs(spans[0].Attributes)
+	if a["gen_ai.compaction.token_threshold"].AsInt64() != 100 {
+		t.Errorf("token_threshold = %d, want 100", a["gen_ai.compaction.token_threshold"].AsInt64())
+	}
+	if _, ok := a["gen_ai.compaction.compaction_interval"]; ok {
+		t.Error("compaction_interval attribute is present on a tail-retention span, want it omitted")
+	}
+}
+
+// TestCompactionSpanRecordsTailRetentionThresholds pins the two attributes only
+// a tail-retention span carries.
+//
+// They are declared in the telemetry commit, where nothing can exercise them
+// because tail retention does not exist yet, so they were unprotected: renaming
+// either one left the suite green. This is the first commit with a producer.
+func TestCompactionSpanRecordsTailRetentionThresholds(t *testing.T) {
+	exp := spanRecorder(t)
+
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"), modelTextEvent("b", "inv1", 2, "a1"),
+		textEvent("c", "inv2", 3, "q2"), modelTextEvent("d", "inv2", 4, "a2"),
+	}
+	cfg := &compaction.Config{
+		TokenThreshold:     10,
+		EventRetentionSize: 1,
+		Summarizer:         &fakeSummarizer{summary: "SUM"},
+	}
+
+	if _, err := TailRetention(context.Background(), cfg, &staticSession{events: events}, func([]*session.Event) int { return 1000 }); err != nil {
+		t.Fatalf("TailRetention() error = %v", err)
+	}
+
+	spans := exp.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	a := attrs(spans[0].Attributes)
+	if got := a["gen_ai.compaction.token_threshold"].AsInt64(); got != 10 {
+		t.Errorf("token_threshold = %d, want 10", got)
+	}
+	if got := a["gen_ai.compaction.event_retention_size"].AsInt64(); got != 1 {
+		t.Errorf("event_retention_size = %d, want 1", got)
+	}
+	// The knobs of the strategy that is not configured stay off the span.
+	if _, ok := a["gen_ai.compaction.interval"]; ok {
+		t.Error("interval attribute is present on a tail-retention span, want it omitted")
+	}
+}
