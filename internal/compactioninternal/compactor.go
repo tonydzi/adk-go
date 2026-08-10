@@ -21,6 +21,8 @@ import (
 
 	"go.opentelemetry.io/otel/codes"
 
+	"google.golang.org/genai"
+
 	"google.golang.org/adk/v2/internal/telemetry"
 	"google.golang.org/adk/v2/platform"
 	"google.golang.org/adk/v2/session"
@@ -88,6 +90,7 @@ func summarizeTraced(ctx context.Context, cfg *compaction.Config, sess session.S
 		Trigger:            trigger,
 		SessionID:          sessionID,
 		SummarizerType:     summarizerTypeName(cfg.Summarizer),
+		Backend:            summarizerBackend(cfg.Summarizer),
 		EventCount:         len(window),
 		CompactionInterval: cfg.CompactionInterval,
 		OverlapSize:        cfg.OverlapSize,
@@ -190,4 +193,17 @@ func summarizerTypeName(s compaction.Summarizer) string {
 		return name
 	}
 	return t.String()
+}
+
+// summarizerBackend reports which Google backend a Summarizer's model talks to.
+//
+// It is an optional interface rather than a field, matching how the rest of the
+// framework distinguishes Vertex AI from the Gemini API: a third-party
+// Summarizer that has no model, or does not care to say, simply leaves the
+// span's gen_ai.system unset rather than being forced to invent one.
+func summarizerBackend(s compaction.Summarizer) genai.Backend {
+	if v, ok := s.(interface{ GetGoogleLLMVariant() genai.Backend }); ok {
+		return v.GetGoogleLLMVariant()
+	}
+	return genai.BackendUnspecified
 }

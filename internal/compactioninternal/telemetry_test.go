@@ -32,6 +32,12 @@ import (
 )
 
 // spanRecorder installs an in-memory tracer for the calling test.
+// spanRecorder installs an in-memory tracer for the duration of a test.
+//
+// It replaces a package-level tracer, so no test in this file may call
+// t.Parallel: a parallel test would swap the tracer while another test is
+// reading it, which the race detector reports and which silently sends spans to
+// the wrong exporter even when it does not.
 func spanRecorder(t *testing.T) *tracetest.InMemoryExporter {
 	t.Helper()
 	exp := tracetest.NewInMemoryExporter()
@@ -292,5 +298,67 @@ func TestCompactionSpanMarksAPanic(t *testing.T) {
 	}
 	if spans[0].Status.Code != codes.Error {
 		t.Errorf("span status = %v, want %v: a panicking summarizer must not look healthy", spans[0].Status.Code, codes.Error)
+	}
+}
+
+// geminiSummarizer reports a backend the way the real summarizer does.
+type geminiSummarizer struct {
+	fakeSummarizer
+	backend genai.Backend
+}
+
+func (s *geminiSummarizer) GetGoogleLLMVariant() genai.Backend { return s.backend }
+
+// TestCompactionSpanRecordsGenAISystem pins gen_ai.system on the span.
+//
+// It names the system that produced the summary, and the reference
+// implementation sets it on every compaction span. A summarizer that does not
+// report a backend leaves it unset rather than guessing.
+func TestCompactionSpanRecordsGenAISystem(t *testing.T) {
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"), modelTextEvent("b", "inv1", 2, "a1"),
+		textEvent("c", "inv2", 3, "q2"), modelTextEvent("d", "inv2", 4, "a2"),
+	}
+
+	tests := []struct {
+		name    string
+		backend genai.Backend
+		want    string // "" means the attribute must be absent
+	}{
+		{name: "vertex ai", backend: genai.BackendVertexAI, want: "gcp.vertex_ai"},
+		{name: "gemini api", backend: genai.BackendGeminiAPI, want: "gcp.gemini"},
+		{name: "summarizer that does not say", backend: genai.BackendUnspecified, want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			exp := spanRecorder(t)
+			cfg := &compaction.Config{
+				CompactionInterval: 2,
+				Summarizer: &geminiSummarizer{
+					fakeSummarizer: fakeSummarizer{summary: "SUM"},
+					backend:        tc.backend,
+				},
+			}
+			if _, err := SlidingWindow(context.Background(), cfg, &staticSession{events: events}); err != nil {
+				t.Fatalf("SlidingWindow() error = %v", err)
+			}
+			spans := exp.GetSpans()
+			if len(spans) != 1 {
+				t.Fatalf("got %d spans, want 1", len(spans))
+			}
+			got, ok := attrs(spans[0].Attributes)["gen_ai.system"]
+			if tc.want == "" {
+				if ok {
+					t.Errorf("gen_ai.system = %q, want it omitted", got.AsString())
+				}
+				return
+			}
+			if !ok {
+				t.Fatal("gen_ai.system is absent")
+			}
+			if got.AsString() != tc.want {
+				t.Errorf("gen_ai.system = %q, want %q", got.AsString(), tc.want)
+			}
+		})
 	}
 }

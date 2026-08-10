@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.36.0"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/session"
 )
@@ -70,8 +71,12 @@ type StartCompactEventsSpanParams struct {
 	Trigger string
 	// SessionID is the session whose history is being compacted.
 	SessionID string
-	// SummarizerType is the concrete Go type of the summarizer in use.
+	// SummarizerType is the bare type name of the summarizer in use.
 	SummarizerType string
+	// Backend is the Google backend the summarizer's model talks to, used to
+	// label the span with gen_ai.system. BackendUnspecified omits the attribute
+	// rather than guessing.
+	Backend genai.Backend
 	// EventCount is how many events were selected for summarization.
 	EventCount int
 
@@ -101,6 +106,17 @@ func StartCompactEventsSpan(ctx context.Context, params StartCompactEventsSpanPa
 		genAICompactionTrigger.String(params.Trigger),
 		genAICompactionSummarizerType.String(params.SummarizerType),
 		genAICompactionEventCount.Int(params.EventCount),
+	}
+	// gen_ai.system names the system that produced the summary. The values come
+	// from this repo's semconv version, which prefixes them "gcp."; adk-python
+	// is on an older generation and emits the bare "gemini" and "vertex_ai".
+	// Consistency inside one implementation matters more here than matching the
+	// other's literal string, and the gap is repo-wide rather than compaction's.
+	switch params.Backend {
+	case genai.BackendVertexAI:
+		attrs = append(attrs, semconv.GenAISystemGCPVertexAI)
+	case genai.BackendGeminiAPI:
+		attrs = append(attrs, semconv.GenAISystemGCPGemini)
 	}
 	// Omit a threshold that is not configured, so a span carries only the
 	// knobs in play. Both strategies may be configured at once, so this says

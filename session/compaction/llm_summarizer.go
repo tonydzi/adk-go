@@ -23,6 +23,7 @@ import (
 
 	"google.golang.org/genai"
 
+	"google.golang.org/adk/v2/internal/llminternal/googlellm"
 	"google.golang.org/adk/v2/internal/utils"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/session"
@@ -423,4 +424,15 @@ func countRenderedParts(events []*session.Event) int {
 		}
 	}
 	return n
+}
+
+// GetGoogleLLMVariant reports which Google backend this summarizer's model
+// talks to, or [genai.BackendUnspecified] for a model that does not say.
+//
+// It satisfies the same optional interface the rest of the framework uses to
+// distinguish Vertex AI from the Gemini API, so telemetry can label a compaction
+// span with the system that produced the summary without the compaction code
+// having to know anything about model construction.
+func (s *LLMSummarizer) GetGoogleLLMVariant() genai.Backend {
+	return googlellm.GetGoogleLLMVariant(s.model)
 }
