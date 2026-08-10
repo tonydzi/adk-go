@@ -18,11 +18,13 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/internal/telemetry"
 	"google.golang.org/adk/v2/session"
@@ -100,12 +102,20 @@ func TestSlidingWindowEmitsSpan(t *testing.T) {
 	if _, ok := a["gen_ai.compaction.token_threshold"]; ok {
 		t.Error("token_threshold attribute is present on a sliding-window span, want it omitted")
 	}
-	// The range must be recorded so a trace shows what the summary replaced.
-	if a["gen_ai.compaction.start_timestamp"].AsString() == "" {
-		t.Error("start_timestamp attribute is empty")
+	// The range must be recorded so a trace shows what the summary replaced,
+	// and it must be the right range in the right layout. Asserting only that
+	// the attributes are non-empty left the layout, the bound each one is
+	// sourced from, and the timestamps themselves all unprotected.
+	wantStart := at(1).Format(time.RFC3339Nano)
+	wantEnd := at(4).Format(time.RFC3339Nano)
+	if got := a["gen_ai.compaction.start_timestamp"].AsString(); got != wantStart {
+		t.Errorf("start_timestamp = %q, want %q", got, wantStart)
 	}
-	if a["gen_ai.compaction.end_timestamp"].AsString() == "" {
-		t.Error("end_timestamp attribute is empty")
+	if got := a["gen_ai.compaction.end_timestamp"].AsString(); got != wantEnd {
+		t.Errorf("end_timestamp = %q, want %q", got, wantEnd)
+	}
+	if got := a["gen_ai.compaction.result_event_id"].AsString(); got == "" {
+		t.Error("result_event_id is empty, so a trace cannot be joined to the stored summary")
 	}
 }
 
@@ -131,6 +141,18 @@ func TestCompactionSpanRecordsFailure(t *testing.T) {
 	}
 	if len(spans[0].Events) == 0 {
 		t.Error("span records no exception event, so the failure reason is lost")
+	}
+	// A failed compaction has no result. Recording one would leave a span that
+	// is at once an error and a success, naming an event nothing ever stored.
+	a := attrs(spans[0].Attributes)
+	for _, key := range []string{
+		"gen_ai.compaction.result_event_id",
+		"gen_ai.compaction.start_timestamp",
+		"gen_ai.compaction.end_timestamp",
+	} {
+		if _, ok := a[key]; ok {
+			t.Errorf("%s is present on a failed compaction span, want it omitted", key)
+		}
 	}
 }
 
@@ -176,5 +198,96 @@ func TestSpanRecordsDecliningSummarizer(t *testing.T) {
 	}
 	if _, ok := attrs(spans[0].Attributes)["gen_ai.compaction.result_event_id"]; ok {
 		t.Error("result_event_id is set although no summary was produced")
+	}
+}
+
+// bothSummarizer returns a usable compaction event alongside an error, which a
+// third-party Summarizer is free to do.
+type bothSummarizer struct{}
+
+func (s *bothSummarizer) SummarizeEvents(_ context.Context, events []*session.Event) (*session.Event, error) {
+	ev, err := compaction.NewSummaryEvent(events, genai.NewContentFromText("SUM", "model"), nil)
+	if err != nil {
+		return nil, err
+	}
+	return ev, errors.New("boom")
+}
+
+// TestCompactionSpanOmitsResultWhenSummarizerAlsoErrors pins that a span is
+// never both an error and a success.
+//
+// A Summarizer may return an event and an error together. The caller discards
+// the event, so recording its identity would name something no session holds,
+// and the span would report a failure while carrying the attributes of a
+// success.
+func TestCompactionSpanOmitsResultWhenSummarizerAlsoErrors(t *testing.T) {
+	exp := spanRecorder(t)
+
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"), modelTextEvent("b", "inv1", 2, "a1"),
+		textEvent("c", "inv2", 3, "q2"), modelTextEvent("d", "inv2", 4, "a2"),
+	}
+	cfg := &compaction.Config{CompactionInterval: 2, Summarizer: &bothSummarizer{}}
+
+	if _, err := SlidingWindow(context.Background(), cfg, &staticSession{events: events}); err == nil {
+		t.Fatal("SlidingWindow() succeeded, want an error")
+	}
+
+	spans := exp.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if spans[0].Status.Code != codes.Error {
+		t.Errorf("span status = %v, want %v", spans[0].Status.Code, codes.Error)
+	}
+	a := attrs(spans[0].Attributes)
+	for _, key := range []string{
+		"gen_ai.compaction.result_event_id",
+		"gen_ai.compaction.start_timestamp",
+		"gen_ai.compaction.end_timestamp",
+	} {
+		if v, ok := a[key]; ok {
+			t.Errorf("%s = %q on a failed compaction span, want it omitted", key, v.AsString())
+		}
+	}
+}
+
+// panickingSummarizer models third-party code that blows up.
+type panickingSummarizer struct{}
+
+func (s *panickingSummarizer) SummarizeEvents(_ context.Context, _ []*session.Event) (*session.Event, error) {
+	panic("summarizer exploded")
+}
+
+// TestCompactionSpanMarksAPanic pins that a panicking summarizer does not leave
+// a span that reads as success.
+//
+// The OTel SDK records an exception event on the way out but leaves the status
+// Unset, and Unset is indistinguishable from a healthy compaction that produced
+// nothing. The panic itself still propagates.
+func TestCompactionSpanMarksAPanic(t *testing.T) {
+	exp := spanRecorder(t)
+
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"), modelTextEvent("b", "inv1", 2, "a1"),
+		textEvent("c", "inv2", 3, "q2"), modelTextEvent("d", "inv2", 4, "a2"),
+	}
+	cfg := &compaction.Config{CompactionInterval: 2, Summarizer: &panickingSummarizer{}}
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("the panic did not propagate; compaction must not swallow it")
+			}
+		}()
+		_, _ = SlidingWindow(context.Background(), cfg, &staticSession{events: events})
+	}()
+
+	spans := exp.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if spans[0].Status.Code != codes.Error {
+		t.Errorf("span status = %v, want %v: a panicking summarizer must not look healthy", spans[0].Status.Code, codes.Error)
 	}
 }

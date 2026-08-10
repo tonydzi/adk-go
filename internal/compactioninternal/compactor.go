@@ -18,6 +18,8 @@ import (
 	"context"
 	"fmt"
 
+	"go.opentelemetry.io/otel/codes"
+
 	"google.golang.org/adk/v2/internal/telemetry"
 	"google.golang.org/adk/v2/platform"
 	"google.golang.org/adk/v2/session"
@@ -91,7 +93,18 @@ func summarizeTraced(ctx context.Context, cfg *compaction.Config, sess session.S
 		TokenThreshold:     cfg.TokenThreshold,
 		EventRetentionSize: cfg.EventRetentionSize,
 	})
-	defer span.End()
+	// A Summarizer is third-party code and may panic. The OTel SDK records an
+	// exception event on the way out but leaves the status Unset, which reads
+	// as success, so a panicking summarizer would look like a healthy one that
+	// happened to produce nothing. Mark it and let the panic continue.
+	defer func() {
+		if r := recover(); r != nil {
+			span.SetStatus(codes.Error, fmt.Sprintf("summarizer panicked: %v", r))
+			span.End()
+			panic(r)
+		}
+		span.End()
+	}()
 
 	summary, err := cfg.Summarizer.SummarizeEvents(ctx, window)
 	// A Summarizer is third-party code. One that returns an ordinary event
@@ -102,7 +115,15 @@ func summarizeTraced(ctx context.Context, cfg *compaction.Config, sess session.S
 		err = fmt.Errorf("summarizer returned an event carrying no compaction record")
 		summary = nil
 	}
-	summary = stamp(ctx, summary)
+	// Stamped only once the result is known to be usable. A summarizer can
+	// return an event alongside an error, and that event is discarded, so
+	// stamping first spent a UUID on it and handed telemetry the identity of
+	// something that never reached the session.
+	if err != nil {
+		summary = nil
+	} else {
+		summary = stamp(ctx, summary)
+	}
 	telemetry.TraceCompactionResult(span, telemetry.TraceCompactionResultParams{
 		ResultEvent: summary,
 		Error:       err,

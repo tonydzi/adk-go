@@ -95,8 +95,9 @@ func StartCompactEventsSpan(ctx context.Context, params StartCompactEventsSpanPa
 		genAICompactionSummarizerType.String(params.SummarizerType),
 		genAICompactionEventCount.Int(params.EventCount),
 	}
-	// Omit a threshold that is not configured, so a span shows only the
-	// strategy that actually fired.
+	// Omit a threshold that is not configured, so a span carries only the
+	// knobs in play. Both strategies may be configured at once, so this says
+	// nothing about which one produced this span; Trigger is what names that.
 	if params.CompactionInterval > 0 {
 		attrs = append(attrs,
 			genAICompactionInterval.Int(params.CompactionInterval),
@@ -126,6 +127,13 @@ type TraceCompactionResultParams struct {
 // produced nothing" from "ran and failed".
 func TraceCompactionResult(span trace.Span, params TraceCompactionResultParams) {
 	recordErrorAndStatus(span, params.Error)
+	if params.Error != nil {
+		// A failed compaction has no result to describe. A summarizer may
+		// return an event alongside an error, and the caller discards it, so
+		// recording its identity here would leave one span that is at once an
+		// error and a success, naming an event that was never appended.
+		return
+	}
 
 	ev := params.ResultEvent
 	if ev == nil || ev.Actions.Compaction == nil {
