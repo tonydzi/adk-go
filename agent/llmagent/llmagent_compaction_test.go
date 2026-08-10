@@ -35,23 +35,29 @@ import (
 	"google.golang.org/adk/v2/tool/functiontool"
 )
 
-//go:generate go test -httprecord=TestCompaction
-
 // TestCompactionE2E drives a real model through enough turns to trigger a
 // sliding-window compaction, then checks that the next prompt is both smaller
 // and still accepted.
 //
-// Everything else about compaction is covered offline with fake summarizers and
-// fake models, which is faster and far less brittle. The one thing those cannot
-// establish is that a compacted prompt is well formed, because a fake model
-// accepts anything handed to it. Only a real request can show that the
-// substituted history still satisfies the API: role alternation holds, no
-// function response is left without its call, and the recovered call ordering
-// survives. That is the whole reason this test talks to a model.
+// What a passing run does and does not establish. Replay keys on exact request
+// bytes, so this proves the recorded model accepted the compacted prompt at the
+// time it was recorded. It does not re-validate anything against a live API: a
+// structural defect introduced later surfaces as a cassette miss, not as an API
+// rejection, and the miss aborts the run before any assertion below is reached.
+// The structural properties are therefore asserted here directly and offline,
+// over the prompts the agent actually sent.
 //
-// Deliberately not asserted: the wording of the summary. It is model output, and
-// pinning it would fail on any model or prompt revision without indicating a
-// real problem.
+// One property is genuinely not covered. The recorded conversation issues no
+// tool call after the compaction point, so the final prompt carries no function
+// traffic at all and the call-pairing and call-recovery paths are inert against
+// this cassette. Those are covered offline in internal/compactioninternal.
+// Covering them here would need a re-record whose fourth turn calls a tool after
+// the summary exists.
+//
+// Deliberately not asserted: any particular wording for the summary. It is model
+// output, and pinning it would fail on any model or prompt revision without
+// indicating a real problem. What is asserted is that whatever the summarizer
+// produced is what reaches the next prompt.
 //
 // Recording: this test needs a cassette. With credentials available, run
 //
@@ -66,9 +72,11 @@ import (
 // and commit the resulting testdata/TestCompactionE2E.httprr. Until then the
 // test skips.
 //
-// Do not record with "go generate ./agent/llmagent/...". That package has a
-// directive with -httprecord=Test, which matches every cassette in it, so a
-// package-wide generate re-records all of them. Note also that a failed
+// This test deliberately has no //go:generate directive of its own. The
+// package-level one already carries -httprecord=Test, which matches every
+// cassette here, so adding a third changed nothing except the number of ways to
+// re-record all of them by accident. For the same reason, do not record with
+// "go generate ./agent/llmagent/...". Note also that a failed
 // recording still leaves a cassette behind, and it can look plausibly sized
 // because the failing exchange is recorded too. Delete it, or the next run finds
 // a file, declines to skip, and replays the recorded failure.
@@ -82,14 +90,17 @@ func TestCompactionE2E(t *testing.T) {
 	// model name is part of the request URL the cassette keys on.
 	const compactionModelName = "gemini-3.5-flash"
 
-	// Skip until the cassette exists, so an unrecorded checkout still has a
-	// green suite. Recording mode goes ahead regardless, since that is the run
-	// that creates the file.
+	// The cassette is committed, so its absence is a lost or renamed file rather
+	// than an unrecorded checkout. Skipping would turn that into a silent pass,
+	// which is how a test quietly stops running for months. Every other cassette
+	// test in this package fails instead, and so does this one. Recording mode
+	// goes ahead regardless, since that is the run that creates the file.
 	trace := filepath.Join("testdata", t.Name()+".httprr")
 	if recording, _ := httprr.Recording(trace); !recording {
 		if _, err := os.Stat(trace); err != nil {
-			t.Skipf("no cassette at %s. Record it with: GOOGLE_API_KEY=... go test ./agent/llmagent/ "+
-				"-run '^TestCompactionE2E$' -httprecord='TestCompactionE2E\\.httprr$' -count=1 -v", trace)
+			t.Fatalf("no cassette at %s: %v. It is committed, so this means it was lost or renamed. "+
+				"Re-record with: GOOGLE_API_KEY=... go test ./agent/llmagent/ "+
+				"-run '^TestCompactionE2E$' -httprecord='TestCompactionE2E\\.httprr$' -count=1 -v", trace, err)
 		}
 	}
 
@@ -138,11 +149,16 @@ func TestCompactionE2E(t *testing.T) {
 		t.Fatalf("llmagent.New() error = %v", err)
 	}
 
-	// Interval 2 keeps the recording short. Overlap 1 exercises the seam logic,
-	// where the second window reaches back into an already-summarized turn.
+	// Interval 2 keeps the recording short: three turns produce exactly one
+	// compaction, which is all this test needs.
+	//
+	// No OverlapSize. It would be inert here and claiming otherwise was wrong:
+	// overlap only reaches back past an earlier compaction, and the first
+	// compaction of a session starts at the first invocation whatever the
+	// overlap is. Exercising the seam needs a second window, so it belongs in
+	// the offline tests where windows are cheap.
 	r := testutil.NewTestAgentRunnerWithCompaction(t, a, &compaction.Config{
 		CompactionInterval: 2,
-		OverlapSize:        1,
 	})
 
 	const sessionID = "compaction_session"
@@ -151,10 +167,13 @@ func TestCompactionE2E(t *testing.T) {
 		"My favourite colour is teal, remember that.",
 		"What was my favourite colour again?",
 	}
+	var lastAnswer []string
 	for i, turn := range turns {
-		if _, err := testutil.CollectTextParts(r.Run(t, sessionID, turn)); err != nil {
+		answer, err := testutil.CollectTextParts(r.Run(t, sessionID, turn))
+		if err != nil {
 			t.Fatalf("turn %d (%q) failed: %v", i+1, turn, err)
 		}
+		lastAnswer = answer
 	}
 
 	// A compaction must have landed. Without this the rest proves nothing.
@@ -194,6 +213,74 @@ func TestCompactionE2E(t *testing.T) {
 	if !strings.Contains(final, turns[len(turns)-1]) {
 		t.Errorf("final prompt is missing the current turn %q:\n%s", turns[len(turns)-1], final)
 	}
+	// Turn 2 is inside the compacted range as well, so it must be gone for the
+	// same reason turn 1 is. Asserting only turn 1 left half the range unchecked.
+	if strings.Contains(final, turns[1]) {
+		t.Errorf("final prompt still contains the compacted second turn %q:\n%s", turns[1], final)
+	}
+
+	// The point of compacting rather than truncating: the fact survives into the
+	// summary and the model can still answer from it. Without this the test
+	// proved the prompt shrank, not that it kept working.
+	answer := strings.ToLower(strings.Join(lastAnswer, " "))
+	if !strings.Contains(answer, "teal") {
+		t.Errorf("the model could not recall the colour from the summary alone; answer was %q", answer)
+	}
+
+	// Structural checks, asserted here rather than inferred from the fact that a
+	// recorded model once accepted the bytes. Every prompt is checked, not only
+	// the final one.
+	for i, p := range prompts {
+		assertNoOrphanFunctionResponses(t, i, p)
+	}
+}
+
+// assertNoOrphanFunctionResponses checks that every function response in a
+// prompt is preceded by the call it answers.
+//
+// This is the property compaction is most likely to break: the summary replaces
+// a span of history, and a response whose call fell inside that span while the
+// response itself did not would reach the model unpaired, which real backends
+// reject.
+func assertNoOrphanFunctionResponses(t *testing.T, promptIdx int, contents []*genai.Content) {
+	t.Helper()
+
+	seenCalls := make(map[string]bool)
+	responses := 0
+	for _, c := range contents {
+		if c == nil {
+			continue
+		}
+		for _, part := range c.Parts {
+			if part == nil {
+				continue
+			}
+			if fc := part.FunctionCall; fc != nil {
+				seenCalls[callKey(fc.ID, fc.Name)] = true
+			}
+			if fr := part.FunctionResponse; fr != nil {
+				responses++
+				if !seenCalls[callKey(fr.ID, fr.Name)] {
+					t.Errorf("prompt %d carries a function response %q with no preceding call", promptIdx, fr.Name)
+				}
+			}
+		}
+	}
+	if responses == 0 {
+		// Not a failure. It is the documented gap: this recording has no tool
+		// traffic after the compaction point, so for the final prompt there is
+		// nothing here to check.
+		t.Logf("prompt %d carries no function responses, so pairing was not exercised in it", promptIdx)
+	}
+}
+
+// callKey identifies a call by ID when the model supplies one, and by name
+// otherwise, which is what happens with models that omit call IDs.
+func callKey(id, name string) string {
+	if id != "" {
+		return "id:" + id
+	}
+	return "name:" + name
 }
 
 func sessionEventsFor(t *testing.T, r *testutil.TestAgentRunner, sessionID string) []*session.Event {
