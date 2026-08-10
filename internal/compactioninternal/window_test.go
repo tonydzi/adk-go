@@ -15,6 +15,7 @@
 package compactioninternal
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -521,12 +522,17 @@ func TestSelectSlidingWindowSurvivesBlockedHead(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		events []*session.Event
-		want   []string
+		name string
+		// interval is chosen per case so the window cap covers every
+		// invocation the case sets up. The subject here is the blocked head,
+		// not the cap.
+		interval int
+		events   []*session.Event
+		want     []string
 	}{
 		{
-			name: "unanswered call at the head is stepped over",
+			name:     "unanswered call at the head is stepped over",
+			interval: 3,
 			events: []*session.Event{
 				// inv1 asks a tool something that never answers.
 				callEvent("stuck", "inv1", 1, "c1"),
@@ -536,7 +542,8 @@ func TestSelectSlidingWindowSurvivesBlockedHead(t *testing.T) {
 			want: []string{"a", "b", "c", "d"},
 		},
 		{
-			name: "unanswered confirmation at the head is stepped over",
+			name:     "unanswered confirmation at the head is stepped over",
+			interval: 3,
 			events: []*session.Event{
 				confirmationEvent("stuck", "inv1", 1, "c1"),
 				textEvent("a", "inv2", 2, "q2"),
@@ -567,7 +574,11 @@ func TestSelectSlidingWindowSurvivesBlockedHead(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			window := selectSlidingWindow(tc.events, 2, 0)
+			interval := tc.interval
+			if interval == 0 {
+				interval = 2
+			}
+			window := selectSlidingWindow(tc.events, interval, 0)
 			if diff := cmp.Diff(tc.want, ids(window)); diff != "" {
 				t.Errorf("selectSlidingWindow() mismatch (-want +got):\n%s", diff)
 			}
@@ -596,5 +607,57 @@ func TestLongestSelfContainedPrefixIDlessCall(t *testing.T) {
 	// The call must block the prefix rather than sail through it.
 	if diff := cmp.Diff([]string{"a"}, ids(longestSelfContainedPrefix(events))); diff != "" {
 		t.Errorf("longestSelfContainedPrefix() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestSelectSlidingWindowIsBoundedByInterval pins that the window covers at
+// most interval new invocations rather than running to the end of the session.
+//
+// Without the cap the window is O(session): enabling compaction on an existing
+// deployment would hand a whole live conversation to a single model call.
+func TestSelectSlidingWindowIsBoundedByInterval(t *testing.T) {
+	t.Parallel()
+
+	// Ten invocations of one turn each, no prior compaction: the entire
+	// backlog is new.
+	var events []*session.Event
+	for i := range 10 {
+		events = append(events, textEvent(fmt.Sprintf("q%d", i), fmt.Sprintf("inv%d", i), i+1, "q"))
+	}
+
+	window := selectSlidingWindow(events, 3, 0)
+	if diff := cmp.Diff([]string{"q0", "q1", "q2"}, ids(window)); diff != "" {
+		t.Errorf("selectSlidingWindow() mismatch (-want +got):\n%s\nthe window must not run to the end of the session", diff)
+	}
+}
+
+// TestSelectSlidingWindowRetryDoesNotGrow pins that a failed attempt comes back
+// to a window of the same size rather than a larger one.
+//
+// A summarizer error records no compaction, so the next turn recomputes from
+// the same start. If the window grew with the session, a transient failure
+// would leave a window that is more likely to fail again, and the session would
+// never recover.
+func TestSelectSlidingWindowRetryDoesNotGrow(t *testing.T) {
+	t.Parallel()
+
+	var events []*session.Event
+	for i := range 3 {
+		events = append(events, textEvent(fmt.Sprintf("q%d", i), fmt.Sprintf("inv%d", i), i+1, "q"))
+	}
+	first := selectSlidingWindow(events, 2, 0)
+
+	// The attempt failed, so nothing was recorded. Two more turns arrive.
+	for i := 3; i < 5; i++ {
+		events = append(events, textEvent(fmt.Sprintf("q%d", i), fmt.Sprintf("inv%d", i), i+1, "q"))
+	}
+	retry := selectSlidingWindow(events, 2, 0)
+
+	if len(retry) != len(first) {
+		t.Errorf("retry window has %d events, want the same %d as the attempt that failed: %v then %v",
+			len(retry), len(first), ids(first), ids(retry))
+	}
+	if diff := cmp.Diff(ids(first), ids(retry)); diff != "" {
+		t.Errorf("retry window mismatch (-first +retry):\n%s", diff)
 	}
 }

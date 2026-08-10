@@ -254,6 +254,13 @@ type EventActions struct {
 
 	// Compaction, when non-nil, marks this event as a context-compaction
 	// summary standing in for a contiguous range of earlier events.
+	//
+	// The framework writes this field and prompt assembly reads it. Setting it
+	// from a tool handler or a callback has no effect: it is cleared wherever
+	// caller-supplied actions are copied onto an event. A record is not a
+	// request but an instruction to drop the events it names and show its own
+	// content in their place, which is not a decision the code running inside a
+	// turn gets to make about the conversation it is running in.
 	Compaction *EventCompaction `json:"compaction,omitempty"`
 }
 

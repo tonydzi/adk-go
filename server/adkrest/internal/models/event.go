@@ -98,7 +98,13 @@ func ToSessionEvent(event Event) *session.Event {
 			SkipSummarization:          event.Actions.SkipSummarization,
 			TransferToAgent:            event.Actions.TransferToAgent,
 			RequestedToolConfirmations: event.Actions.RequestedToolConfirmations,
-			Compaction:                 event.Actions.Compaction,
+			// Actions.Compaction is deliberately not mapped inbound. A
+			// compaction record tells prompt assembly to drop a span of history
+			// and substitute content in its place, so honouring one from a
+			// request body would let a client erase a conversation and inject
+			// text into it as a model turn. Only the runner writes these.
+			// FromSessionEvent still returns them, so a client can read
+			// summaries it did not author.
 		},
 	}
 }

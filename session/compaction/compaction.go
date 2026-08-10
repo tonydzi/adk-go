@@ -49,10 +49,29 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"google.golang.org/adk/v2/session"
 )
+
+// ErrCompaction marks an error as a compaction failure rather than a failure of
+// the turn itself.
+//
+// Compaction is bookkeeping: the events of the turn are already persisted
+// before it runs, so a failure costs a smaller prompt later, not the user's
+// answer. It still surfaces, because a summarizer that never succeeds is worth
+// knowing about, but a caller that would rather log it than fail the turn can
+// tell the two apart:
+//
+//	for event, err := range r.Run(...) {
+//		if errors.Is(err, compaction.ErrCompaction) {
+//			log.Printf("compaction failed: %v", err)
+//			continue
+//		}
+//		...
+//	}
+var ErrCompaction = errors.New("context compaction failed")
 
 // Config configures context compaction for an application.
 //
@@ -68,11 +87,24 @@ type Config struct {
 	// CompactionInterval is the number of new user-initiated invocations that,
 	// once fully represented in the session's events, triggers a sliding-window
 	// compaction. Zero, the default, disables sliding-window compaction.
+	//
+	// It also bounds the window: one compaction covers at most this many new
+	// invocations, so enabling compaction on a session that already has a long
+	// history drains the backlog a window at a time rather than summarizing all
+	// of it in one call.
 	CompactionInterval int
 
 	// OverlapSize is how many already-compacted invocations to pull back into
 	// the next sliding window, creating an overlap between consecutive
 	// summaries for continuity. Only meaningful alongside CompactionInterval.
+	//
+	// The overlap is repeated, not shared: an invocation pulled back in is
+	// described by both summaries, so the model sees it twice and the prompt
+	// carries roughly OverlapSize invocations of extra text per summary. That
+	// is the cost of the continuity, and it cannot be trimmed away afterwards,
+	// because by then the repetition lives inside summary prose rather than in
+	// the ranges. Leave it at zero unless summaries are visibly losing the
+	// thread between windows.
 	OverlapSize int
 
 	// TokenThreshold is the prompt token count at which intra-invocation

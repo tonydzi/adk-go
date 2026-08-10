@@ -16,7 +16,9 @@ package compaction
 
 import (
 	"testing"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/internal/utils"
@@ -92,5 +94,55 @@ func TestNewSummaryEventRejectsBadInput(t *testing.T) {
 				t.Errorf("NewSummaryEvent() error = %v, wantErr %t", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestNewSummaryEventKeepsPartMetadata checks that a surviving text part is
+// copied whole rather than rebuilt from its text.
+//
+// A text part can carry metadata that belongs with it, a thought signature
+// above all, which the model expects to get back alongside the text it
+// accompanies. Rebuilding the part would drop that silently.
+func TestNewSummaryEventKeepsPartMetadata(t *testing.T) {
+	t.Parallel()
+
+	events := []*session.Event{
+		{Timestamp: time.Unix(1, 0)},
+		{Timestamp: time.Unix(2, 0)},
+	}
+	summary := &genai.Content{Role: "model", Parts: []*genai.Part{{
+		Text:             "the summary",
+		ThoughtSignature: []byte("opaque-signature"),
+	}}}
+
+	got, err := NewSummaryEvent(events, summary, nil)
+	if err != nil {
+		t.Fatalf("NewSummaryEvent() error = %v", err)
+	}
+	parts := got.Actions.Compaction.CompactedContent.Parts
+	if len(parts) != 1 {
+		t.Fatalf("got %d parts, want 1", len(parts))
+	}
+	if diff := cmp.Diff([]byte("opaque-signature"), parts[0].ThoughtSignature); diff != "" {
+		t.Errorf("ThoughtSignature mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestNewSummaryEventRejectsProselessSummary checks that a summary whose only
+// text rides on an actionable part is refused rather than stored empty.
+func TestNewSummaryEventRejectsProselessSummary(t *testing.T) {
+	t.Parallel()
+
+	events := []*session.Event{
+		{Timestamp: time.Unix(1, 0)},
+		{Timestamp: time.Unix(2, 0)},
+	}
+	summary := &genai.Content{Role: "model", Parts: []*genai.Part{{
+		Text:         "transferring now",
+		FunctionCall: &genai.FunctionCall{Name: "transfer_funds"},
+	}}}
+
+	if _, err := NewSummaryEvent(events, summary, nil); err == nil {
+		t.Error("NewSummaryEvent() accepted a summary with no prose, want an error rather than an empty summary")
 	}
 }

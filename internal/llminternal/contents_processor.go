@@ -26,6 +26,7 @@ import (
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/internal/agent/compactionctx"
 	"google.golang.org/adk/v2/internal/compactioninternal"
 	"google.golang.org/adk/v2/internal/utils"
 	"google.golang.org/adk/v2/model"
@@ -50,9 +51,21 @@ func ContentsRequestProcessor(ctx agent.InvocationContext, req *model.LLMRequest
 			// Include current turn context only (no conversation history)
 			fn = buildContentsCurrentTurnContextOnly
 		}
+		// A compaction record instructs prompt assembly to drop a span of
+		// history and substitute content in its place. EventActions is
+		// writable by tool code, and the REST create-session body maps it
+		// verbatim onto the stored event, so honouring any record found in a
+		// session would be an erase-and-inject primitive that works even for an
+		// application that never enabled compaction. Records are therefore only
+		// honoured when this run actually has compaction configured.
+		compactionEnabled := compactionctx.FromContext(ctx).Configured()
+
 		var events []*session.Event
 		if ctx.Session() != nil {
 			for e := range ctx.Session().Events().All() {
+				if !compactionEnabled && e.Actions.Compaction != nil {
+					continue
+				}
 				events = append(events, e)
 			}
 		}
@@ -118,7 +131,10 @@ func buildContentsDefault(agentName, invocationBranch, isolationScope string, ev
 
 	// Replace each compaction summary with the events it covers, so a long
 	// session is presented to the model as summaries plus recent raw turns.
-	// A no-op when the session holds no compaction events.
+	//
+	// A no-op when the session holds no compaction events. Records only reach
+	// here when compaction is configured for the run: ContentsRequestProcessor
+	// drops them at collection otherwise.
 	filtered = compactioninternal.Apply(filtered)
 
 	// Aggregate transcription events (convert to text parts on the fly)

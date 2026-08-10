@@ -423,3 +423,81 @@ func TestApplyRecoveryBoundary(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyEqualRangeSummariesKeepCoverage checks that discarding one of two
+// summaries with identical ranges does not also lose what they covered. The
+// survivor spans the same events, so its content stands in for them.
+//
+// Equal ranges are not reachable from a single invocation, since each window
+// starts after the previous compaction. They were a second-order consequence of
+// two invocations compacting the same session concurrently, which the runner
+// now prevents by re-reading and discarding a summary whose range was raced.
+func TestApplyEqualRangeSummariesKeepCoverage(t *testing.T) {
+	t.Parallel()
+
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "TURN-ONE"),
+		modelTextEvent("b", "inv1", 2, "TURN-TWO"),
+		compactionEvent("s1", 3, 1, 2, "SUM-1"),
+		compactionEvent("s2", 4, 1, 2, "SUM-2"),
+		textEvent("c", "inv2", 5, "TURN-FIVE"),
+	}
+
+	got := Apply(events)
+	if diff := cmp.Diff([]string{"s2", "c"}, ids(got)); diff != "" {
+		t.Errorf("Apply() mismatch (-want +got):\n%s", diff)
+	}
+	// The covered span must still be represented by the surviving summary
+	// rather than vanishing along with the discarded one.
+	if texts := utils.TextParts(utils.Content(got[0])); len(texts) != 1 || texts[0] != "SUM-2" {
+		t.Errorf("surviving summary content = %v, want SUM-2 standing in for the covered turns", texts)
+	}
+}
+
+// TestApplyPreservesStreamOrder pins that Apply does not reorder by timestamp.
+//
+// Clock skew between writers, or the microsecond truncation the SQL backend
+// applies, can leave a response with an earlier timestamp than the call it
+// answers. Sorting on timestamp would then emit the response first.
+func TestApplyPreservesStreamOrder(t *testing.T) {
+	t.Parallel()
+
+	call := callEvent("call", "inv1", 9, "c1")
+	resp := responseEvent("resp", "inv1", 8, "c1") // earlier timestamp than its call
+	events := []*session.Event{
+		textEvent("u", "inv1", 1, "q"),
+		compactionEvent("s1", 2, 1, 1, "SUM"),
+		call,
+		resp,
+	}
+
+	got := ids(Apply(events))
+	if diff := cmp.Diff([]string{"s1", "call", "resp"}, got); diff != "" {
+		t.Errorf("Apply() mismatch (-want +got):\n%s\nthe response must not precede its call", diff)
+	}
+}
+
+// TestApplySummaryPrecedesUncoveredTail pins where a summary lands when the
+// event declaring it was appended some way after the range it covers.
+//
+// A compaction event follows the range it summarizes, but not necessarily
+// immediately: raw turns can sit in between. Materializing the summary at the
+// declaring event's own position would show the model a summary of older
+// history after the newer turns it precedes.
+func TestApplySummaryPrecedesUncoveredTail(t *testing.T) {
+	t.Parallel()
+
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"),
+		modelTextEvent("b", "inv1", 2, "a1"),
+		textEvent("c", "inv2", 3, "q2"),
+		modelTextEvent("d", "inv2", 4, "a2"),
+		// Covers only the first exchange, but is appended after the second.
+		compactionEvent("s1", 5, 1, 2, "SUM"),
+	}
+
+	got := ids(Apply(events))
+	if diff := cmp.Diff([]string{"s1", "c", "d"}, got); diff != "" {
+		t.Errorf("Apply() mismatch (-want +got):\n%s\nthe summary must precede the turns it does not cover", diff)
+	}
+}

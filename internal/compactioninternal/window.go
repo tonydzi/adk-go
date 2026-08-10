@@ -205,8 +205,19 @@ func selectSlidingWindow(events []*session.Event, interval, overlap int) []*sess
 		return nil
 	}
 
+	// Cover at most interval new invocations, rather than running to the end of
+	// the session.
+	//
+	// Uncapped, the window is O(session) instead of O(interval): the first
+	// compaction after enabling the feature on an existing deployment would
+	// hand a whole live conversation to one model call, which can exceed the
+	// summarizer's own context limit. It also compounds, because a summarizer
+	// error records nothing, so the next turn recomputes from the same start
+	// over a strictly larger window and is more likely to fail again. Capping
+	// makes a retry the same size as the attempt that failed, and drains any
+	// backlog one bounded window per turn.
 	startID := order[max(0, firstNew-overlap)]
-	endID := order[len(order)-1]
+	endID := order[min(len(order)-1, firstNew+interval-1)]
 
 	// Slice from the first event of startID through the last of endID. Events
 	// in between are included whatever they are, including ones with no
@@ -239,10 +250,32 @@ func selectSlidingWindow(events []*session.Event, interval, overlap int) []*sess
 		window = append(window, ev)
 	}
 
+	// A summary inherits the branch and isolation scope of what it covers, so
+	// the window has to be homogeneous in both. A contiguous slice of a
+	// multi-agent session routinely spans branches, and summarizing across one
+	// would fold a sub-agent's content into a summary visible to the parent,
+	// defeating the filters that keep those separate.
+	window = trimToOneScope(window)
+
 	if trimmed := longestSelfContainedPrefix(window); len(trimmed) > 0 {
 		return trimmed
 	}
 	return skipBlockedHead(window)
+}
+
+// trimToOneScope cuts the window at the first event whose branch or isolation
+// scope differs from the first event's.
+func trimToOneScope(window []*session.Event) []*session.Event {
+	if len(window) == 0 {
+		return window
+	}
+	branch, scope := window[0].Branch, window[0].IsolationScope
+	for i, ev := range window {
+		if ev.Branch != branch || ev.IsolationScope != scope {
+			return window[:i]
+		}
+	}
+	return window
 }
 
 // skipBlockedHead handles a window whose very first events hold a function call

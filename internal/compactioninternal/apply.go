@@ -80,62 +80,84 @@ func substituteSummaries(events []*session.Event) []*session.Event {
 		kept = append(kept, keptRange{index: i, rng: ev.Actions.Compaction})
 	}
 
-	// Position each event by (timestamp, original index) so summaries slot in
-	// among the raw events they neighbour rather than all bunching at the end.
-	type positioned struct {
-		index int
-		event *session.Event
-	}
-	out := make([]positioned, 0, len(events))
-
+	// Each surviving summary is emitted where the first event it covers sat,
+	// and the events it covers are dropped.
+	//
+	// Stream position rather than timestamp: sorting the result on timestamp
+	// could reorder raw events whose timestamps disagree with their arrival
+	// order -- clock skew between writers, or the microsecond truncation the
+	// SQL backend applies -- and so put a function response ahead of the call
+	// it answers.
+	//
+	// The first covered event rather than the compaction event's own position:
+	// a compaction event is appended after the range it covers, but not
+	// necessarily right after it. Tail retention leaves a raw tail in between,
+	// and emitting the summary where the compaction event sits would show the
+	// model a summary of older history after the recent turns that follow it.
+	summariesAt := make(map[int][]keptRange, len(kept))
 	for _, k := range kept {
-		summary := *events[k.index]
-		summary.Author = "model"
-		summary.Timestamp = k.rng.EndTimestamp
-		summary.LLMResponse.Content = k.rng.CompactedContent
-		out = append(out, positioned{index: k.index, event: &summary})
+		at := summaryIndex(events, k)
+		summariesAt[at] = append(summariesAt[at], k)
 	}
 
+	out := make([]*session.Event, 0, len(events))
 	for i, ev := range events {
-		// Any event declaring a compaction is handled above, or was dropped as
-		// subsumed or unusable. Never re-emit it as a raw event: its content
-		// slot holds no conversation, only bookkeeping.
+		for _, k := range summariesAt[i] {
+			summary := *events[k.index]
+			summary.Author = "model"
+			summary.Timestamp = k.rng.EndTimestamp
+			summary.LLMResponse.Content = k.rng.CompactedContent
+			out = append(out, &summary)
+		}
 		if hasCompaction(ev) {
+			// An event declaring a compaction is bookkeeping, never
+			// conversation: its content slot holds nothing to show the model,
+			// and its summary was emitted above at the position of the range it
+			// covers.
 			continue
 		}
 		if isCovered(i, ev, kept) {
 			continue
 		}
-		out = append(out, positioned{index: i, event: ev})
+		out = append(out, ev)
 	}
+	return out
+}
 
-	slices.SortStableFunc(out, func(a, b positioned) int {
-		if c := a.event.Timestamp.Compare(b.event.Timestamp); c != 0 {
-			return c
+// summaryIndex is the stream position at which k's summary materializes: where
+// the first event it covers sat, or the compaction event itself when it covers
+// nothing left in the stream.
+func summaryIndex(events []*session.Event, k keptRange) int {
+	for i, ev := range events {
+		if hasCompaction(ev) {
+			continue
 		}
-		return a.index - b.index
-	})
-
-	result := make([]*session.Event, len(out))
-	for i, p := range out {
-		result[i] = p.event
+		if coveredBy(i, ev, k) {
+			return i
+		}
 	}
-	return result
+	return k.index
 }
 
 // isCovered reports whether the raw event at index i falls inside a surviving
-// compaction range. Only a compaction appearing later in the stream can cover
-// an event: a summary never covers events recorded after it was written.
+// compaction range.
 func isCovered(i int, ev *session.Event, kept []keptRange) bool {
 	for _, k := range kept {
-		if i >= k.index {
-			continue
-		}
-		if !ev.Timestamp.Before(k.rng.StartTimestamp) && !ev.Timestamp.After(k.rng.EndTimestamp) {
+		if coveredBy(i, ev, k) {
 			return true
 		}
 	}
 	return false
+}
+
+// coveredBy reports whether the raw event at index i falls inside k's range.
+// Only a compaction appearing later in the stream can cover an event: a summary
+// never covers events recorded after it was written.
+func coveredBy(i int, ev *session.Event, k keptRange) bool {
+	if i >= k.index {
+		return false
+	}
+	return !ev.Timestamp.Before(k.rng.StartTimestamp) && !ev.Timestamp.After(k.rng.EndTimestamp)
 }
 
 // recoverCompactedFunctionCalls re-injects function-call events that compaction
@@ -254,4 +276,45 @@ func recoverCompactedFunctionCalls(events, sourceEvents []*session.Event) []*ses
 		result = append(result, ev)
 	}
 	return result
+}
+
+// RangeRaced reports whether the session gained an event inside summary's range
+// while the summary was being produced.
+//
+// A summary records the span it covers as an inclusive timestamp range, and
+// prompt assembly drops everything inside that range. Summarizing takes a model
+// call, so a concurrent invocation on the same session can append inside the
+// chosen span while it is in flight. Recording the summary anyway would drop
+// those turns from every later prompt without ever having summarized them.
+//
+// selectedFrom is the session state the window was chosen from, and latest is a
+// fresh read taken after summarizing. An event inside the range that is present
+// in latest but absent from selectedFrom arrived too late to be summarized.
+// Comparing the two states makes this exact rather than a guess about
+// timestamps.
+//
+// Callers discard the summary when this returns true.
+func RangeRaced(latest, selectedFrom session.Session, summary *session.Event) bool {
+	rng := summary.Actions.Compaction
+	if latest == nil || selectedFrom == nil || rng == nil {
+		return false
+	}
+
+	known := make(map[string]struct{})
+	for _, ev := range collect(selectedFrom) {
+		known[ev.ID] = struct{}{}
+	}
+
+	for _, ev := range collect(latest) {
+		if hasCompaction(ev) {
+			continue
+		}
+		if ev.Timestamp.Before(rng.StartTimestamp) || ev.Timestamp.After(rng.EndTimestamp) {
+			continue
+		}
+		if _, seen := known[ev.ID]; !seen {
+			return true
+		}
+	}
+	return false
 }

@@ -64,6 +64,17 @@ type LLMSummarizerConfig struct {
 	// arguments or response. Defaults to [DefaultMaxToolContentChars]; a
 	// negative value disables truncation.
 	MaxToolContentChars int
+
+	// GenerateContentConfig is applied to the summarization call.
+	//
+	// The runner passes the root agent's config here, so safety settings and
+	// output limits an application deliberately configured also govern the one
+	// call that processes the whole conversation transcript. Without it that
+	// call silently falls back to provider defaults.
+	//
+	// SystemInstruction and Tools are cleared: the summarizer has its own
+	// instruction and must not be offered tools to call.
+	GenerateContentConfig *genai.GenerateContentConfig
 }
 
 // LLMSummarizer is the default [Summarizer]. It renders the events as a
@@ -80,6 +91,7 @@ type LLMSummarizer struct {
 	model               model.LLM
 	promptTemplate      string
 	maxToolContentChars int
+	genConfig           *genai.GenerateContentConfig
 }
 
 var _ Summarizer = (*LLMSummarizer)(nil)
@@ -104,6 +116,7 @@ func NewLLMSummarizer(cfg LLMSummarizerConfig) (*LLMSummarizer, error) {
 		model:               cfg.Model,
 		promptTemplate:      template,
 		maxToolContentChars: maxChars,
+		genConfig:           summarizerGenConfig(cfg.GenerateContentConfig),
 	}, nil
 }
 
@@ -117,6 +130,7 @@ func (s *LLMSummarizer) SummarizeEvents(ctx context.Context, events []*session.E
 	req := &model.LLMRequest{
 		Model:    s.model.Name(),
 		Contents: []*genai.Content{genai.NewContentFromText(prompt, genai.RoleUser)},
+		Config:   s.genConfig,
 	}
 
 	var finishReason genai.FinishReason
@@ -259,4 +273,23 @@ func escapeLines(text string) string {
 	}
 	r := strings.NewReplacer("\r\n", "\\n", "\n", "\\n", "\r", "\\n")
 	return r.Replace(text)
+}
+
+// summarizerGenConfig adapts an application's generation config for the
+// summarization call.
+//
+// Safety settings and output limits carry over, because an application that
+// tightened them meant them to apply to every call the framework makes on its
+// behalf. The system instruction and tools do not: the summarizer supplies its
+// own instruction, and offering it tools would invite a summary containing a
+// function call that nothing is waiting for.
+func summarizerGenConfig(cfg *genai.GenerateContentConfig) *genai.GenerateContentConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := *cfg
+	out.SystemInstruction = nil
+	out.Tools = nil
+	out.ToolConfig = nil
+	return &out
 }

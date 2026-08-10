@@ -19,10 +19,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"log"
 
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/internal/agent/compactionctx"
 	"google.golang.org/adk/v2/internal/agent/parentmap"
 	"google.golang.org/adk/v2/internal/agent/runconfig"
 	artifactinternal "google.golang.org/adk/v2/internal/artifact"
@@ -70,11 +72,47 @@ func (r *Runner) runNode(
 	opts runOptions,
 	yield func(*session.Event, error) bool,
 ) {
+	// An invocation that ended in an error is not a finished turn and must not
+	// be summarized: the window would hold a question with no answer, and that
+	// summary is stored permanently and degrades every later prompt. Observing
+	// it here, rather than at each error site, means no path can forget to.
+	invocationFailed := false
+	emit := yield
+	yield = func(ev *session.Event, err error) bool {
+		if err != nil {
+			invocationFailed = true
+		}
+		return emit(ev, err)
+	}
+
 	node, err := buildRunnerNode(agentToRun)
 	if err != nil {
 		yield(nil, err)
 		return
 	}
+
+	// Compaction has to happen however iteration ends. Breaking out of the
+	// range loop on the terminal event is the ordinary streaming idiom, and
+	// what the A2A executor does, so a hook placed only after the loop would
+	// never run for those callers and compaction would silently never happen.
+	// Deferring makes it unconditional.
+	//
+	// On an early exit the error cannot be yielded, because yield must not be
+	// called once it has returned false, so it is logged instead.
+	compacted := false
+	compactOnce := func() error {
+		if compacted || invocationFailed {
+			return nil
+		}
+		compacted = true
+		return r.compactAfterInvocation(ctx, storedSession)
+	}
+	defer func() {
+		if err := compactOnce(); err != nil {
+			log.Printf("adk: %v", err)
+		}
+	}()
+
 	// Architectural note: Unlike Go, Python ADK executes standalone agents
 	// directly via agent.run_async. Go wraps top-level agents in a synthetic
 	// single-node workflow (START -> node) so all execution rides through
@@ -195,7 +233,11 @@ func (r *Runner) runNode(
 
 	// Compact once the invocation is done and every event it produced has been
 	// persisted. Never mid-invocation: that is tail retention's job.
-	if err := r.compactAfterInvocation(ictx, storedSession); err != nil {
+	//
+	// compactOnce is idempotent because the deferred call also runs it.
+	// Reaching it here means the consumer drained the stream, so a failure can
+	// still be reported.
+	if err := compactOnce(); err != nil {
 		yield(nil, err)
 		return
 	}
@@ -223,6 +265,7 @@ func (r *Runner) newNodeInvocationContext(
 		StreamingMode: runconfig.StreamingMode(cfg.StreamingMode),
 	})
 	ctx = plugininternal.ToContext(ctx, r.pluginManager)
+	ctx = compactionctx.ToContext(ctx, r.compactionRuntime())
 
 	var artifacts agent.Artifacts
 	if r.artifactService != nil {
