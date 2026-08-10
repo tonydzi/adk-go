@@ -501,3 +501,54 @@ func TestApplySummaryPrecedesUncoveredTail(t *testing.T) {
 		t.Errorf("Apply() mismatch (-want +got):\n%s\nthe summary must precede the turns it does not cover", diff)
 	}
 }
+
+// TestApplyContentlessRecordDoesNotEvictASummary checks that a compaction
+// record carrying no content cannot subsume a real summary.
+//
+// Subsumption used to key on the weaker "declares a compaction" predicate while
+// substitution kept only records with content, so a contentless record could
+// evict a usable summary and leave nothing representing the range. A record like
+// that reaches a session from a third-party Summarizer or a backend that
+// round-trips the field lossily.
+func TestApplyContentlessRecordDoesNotEvictASummary(t *testing.T) {
+	t.Parallel()
+
+	real := compactionEvent("s1", 3, 1, 2, "SUM")
+	// A wider, contentless record recorded afterwards.
+	blank := compactionEvent("s2", 4, 1, 2, "")
+	blank.Actions.Compaction.CompactedContent = nil
+
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"),
+		modelTextEvent("b", "inv1", 2, "a1"),
+		real,
+		blank,
+		textEvent("c", "inv2", 5, "q2"),
+	}
+
+	got := ids(Apply(events))
+	if diff := cmp.Diff([]string{"s1", "c"}, got); diff != "" {
+		t.Errorf("Apply() mismatch (-want +got):\n%s\na contentless record must not destroy a summary already paid for", diff)
+	}
+}
+
+// TestApplyToleratesNilEvents checks that Apply does not panic on a nil entry.
+// Apply is reachable from an exported entry point, so a malformed list must be
+// an input it survives rather than a crash.
+func TestApplyToleratesNilEvents(t *testing.T) {
+	t.Parallel()
+
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"),
+		nil,
+		modelTextEvent("b", "inv1", 2, "a1"),
+		compactionEvent("s1", 3, 1, 1, "SUM"),
+		nil,
+		textEvent("c", "inv2", 4, "q2"),
+	}
+
+	got := ids(Apply(events))
+	if diff := cmp.Diff([]string{"s1", "b", "c"}, got); diff != "" {
+		t.Errorf("Apply() mismatch (-want +got):\n%s", diff)
+	}
+}

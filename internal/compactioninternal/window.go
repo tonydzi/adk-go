@@ -22,6 +22,7 @@ import (
 
 	"google.golang.org/adk/v2/internal/utils"
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/session/compaction"
 )
 
 // longestSelfContainedPrefix returns the longest prefix of events that is safe
@@ -124,7 +125,13 @@ func LatestCompactionEvent(events []*session.Event) *session.Event {
 // stream position: the earlier event is subsumed by the later one.
 func isCompactionSubsumed(i int, rng *session.EventCompaction, events []*session.Event) bool {
 	for j, other := range events {
-		if j == i || !hasCompaction(other) {
+		// IsCompactionEvent rather than hasCompaction: only a record carrying
+		// usable content may evict another. Keying on the weaker predicate let
+		// a contentless record subsume a real summary, destroying one already
+		// paid for. Nothing then represented the range: the covered events fell
+		// back to raw and the boundary calculation went on pointing at the
+		// useless record.
+		if j == i || !compaction.IsCompactionEvent(other) {
 			continue
 		}
 		o := other.Actions.Compaction

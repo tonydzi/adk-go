@@ -109,6 +109,13 @@ func substituteSummaries(events []*session.Event) []*session.Event {
 			summary.LLMResponse.Content = k.rng.CompactedContent
 			out = append(out, &summary)
 		}
+		if ev == nil {
+			// A nil entry is not conversation and nothing can cover it.
+			// Dropping it keeps Apply total over its input: it is reachable
+			// from an exported entry point, so a malformed event list should
+			// not panic deep inside coverage arithmetic.
+			continue
+		}
 		if hasCompaction(ev) {
 			// An event declaring a compaction is bookkeeping, never
 			// conversation: its content slot holds nothing to show the model,
@@ -129,7 +136,7 @@ func substituteSummaries(events []*session.Event) []*session.Event {
 // nothing left in the stream.
 func summaryIndex(events []*session.Event, k keptRange) int {
 	for i, ev := range events {
-		if hasCompaction(ev) {
+		if ev == nil || hasCompaction(ev) {
 			continue
 		}
 		if coveredBy(i, ev, k) {
@@ -142,6 +149,9 @@ func summaryIndex(events []*session.Event, k keptRange) int {
 // isCovered reports whether the raw event at index i falls inside a surviving
 // compaction range.
 func isCovered(i int, ev *session.Event, kept []keptRange) bool {
+	if ev == nil {
+		return false
+	}
 	for _, k := range kept {
 		if coveredBy(i, ev, k) {
 			return true

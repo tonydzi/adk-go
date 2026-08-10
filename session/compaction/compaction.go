@@ -75,8 +75,10 @@ var ErrCompaction = errors.New("context compaction failed")
 
 // Config configures context compaction for an application.
 //
-// Two independent strategies are available, and enabling neither disables
-// compaction entirely:
+// Two independent strategies are available, and at least one must be enabled.
+// A Config that enables neither is rejected by [Config.Validate], because it
+// would cost a configuration step and do nothing; leave the whole Config nil to
+// disable compaction:
 //
 //   - Sliding window (CompactionInterval, OverlapSize) runs after an invocation
 //     completes and summarizes whole invocations at a time.

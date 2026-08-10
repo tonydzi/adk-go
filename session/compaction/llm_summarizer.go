@@ -141,6 +141,14 @@ func (s *LLMSummarizer) SummarizeEvents(ctx context.Context, events []*session.E
 		if resp == nil {
 			continue
 		}
+		// A partial response is a fragment of a stream. Taking the first one
+		// would store a truncated summary and lose the usage metadata that only
+		// the final response carries. This summarizer asks for a non-streaming
+		// call, so a well-behaved model never sends these, but model.LLM is an
+		// exported interface and Partial exists precisely to mark the case.
+		if resp.Partial {
+			continue
+		}
 		if resp.FinishReason != "" {
 			finishReason = resp.FinishReason
 		}
@@ -196,6 +204,9 @@ func (s *LLMSummarizer) formatEvents(events []*session.Event) string {
 		}
 		isCompaction := ev.Actions.Compaction != nil
 		for _, p := range content.Parts {
+			if p == nil {
+				continue
+			}
 			switch {
 			case p.Thought && p.Text != "":
 				if !isCompaction {
@@ -211,6 +222,14 @@ func (s *LLMSummarizer) formatEvents(events []*session.Event) string {
 			if p.FunctionResponse != nil {
 				lines = append(lines, fmt.Sprintf("Tool response from %s: %s",
 					p.FunctionResponse.Name, escapeLines(s.truncate(stringify(p.FunctionResponse.Response)))))
+			}
+			// Everything else gets a placeholder rather than nothing. Dropping
+			// the bytes of an image or a code-execution result is right, but
+			// dropping the fact that the turn happened is not: after compaction
+			// the transcript is all that is left, and an event made only of
+			// these parts would render as an empty line.
+			if kind := placeholderKind(p); kind != "" {
+				lines = append(lines, fmt.Sprintf("%s: [%s]", ev.Author, kind))
 			}
 		}
 	}
@@ -292,4 +311,32 @@ func summarizerGenConfig(cfg *genai.GenerateContentConfig) *genai.GenerateConten
 	out.Tools = nil
 	out.ToolConfig = nil
 	return &out
+}
+
+// placeholderKind names the payload of a part the transcript cannot render
+// literally, or "" for a part already rendered elsewhere.
+//
+// The bytes are deliberately not included. What matters after compaction is
+// that the turn is known to have happened and roughly what it carried.
+func placeholderKind(p *genai.Part) string {
+	switch {
+	case p.InlineData != nil:
+		return mimeOr(p.InlineData.MIMEType, "inline data")
+	case p.FileData != nil:
+		return mimeOr(p.FileData.MIMEType, "file")
+	case p.ExecutableCode != nil:
+		return "executable code"
+	case p.CodeExecutionResult != nil:
+		return "code execution result"
+	default:
+		return ""
+	}
+}
+
+// mimeOr returns a short attachment label for a MIME type, or fallback.
+func mimeOr(mimeType, fallback string) string {
+	if mimeType == "" {
+		return fallback
+	}
+	return mimeType + " attachment"
 }

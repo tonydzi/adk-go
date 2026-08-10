@@ -44,6 +44,14 @@ func NewSummaryEvent(events []*session.Event, summary *genai.Content, usage *gen
 	if !hasText(summary) {
 		return nil, fmt.Errorf("summary content is empty, so compacting would delete the covered events and replace them with nothing")
 	}
+	// NewSummaryEvent is exported and called by third-party Summarizer
+	// implementations, so a nil element is an input to reject rather than a
+	// panic to hand back.
+	for i, ev := range events {
+		if ev == nil {
+			return nil, fmt.Errorf("events[%d] is nil", i)
+		}
+	}
 	start, end := events[0].Timestamp, events[len(events)-1].Timestamp
 	if end.Before(start) {
 		return nil, fmt.Errorf("events are not in chronological order: first event is at %v, last at %v", start, end)
