@@ -367,7 +367,7 @@ func TestLLMSummarizerTruncatesByCharactersNotBytes(t *testing.T) {
 				t.Fatalf("NewLLMSummarizer() error = %v", err)
 			}
 
-			got := s.truncate(tc.text)
+			got := s.truncateTo(tc.text, s.maxToolContentChars)
 			if !utf8.ValidString(got) {
 				t.Error("truncated text is not valid UTF-8; the cut landed mid-rune")
 			}
@@ -399,7 +399,7 @@ func TestLLMSummarizerTruncationIsDisabledByNegativeMax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLLMSummarizer() error = %v", err)
 	}
-	if got := s.truncate(jp); got != jp {
+	if got := s.truncateTo(jp, s.maxToolContentChars); got != jp {
 		t.Error("a negative MaxToolContentChars must disable truncation entirely")
 	}
 }
@@ -512,7 +512,7 @@ func TestFormatEventsRendersUnhandledPartKinds(t *testing.T) {
 	ev := newEvent("a", "inv1", 1, "user", &genai.Part{
 		InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("not-really-a-png")},
 	})
-	got := s.formatEvents([]*session.Event{ev})
+	got := s.formatEvents([]*session.Event{ev}, s.maxToolContentChars)
 	if got == "" {
 		t.Fatal("an event carrying only inline data rendered as an empty transcript")
 	}
@@ -532,8 +532,68 @@ func TestFormatEventsToleratesNilParts(t *testing.T) {
 	}
 
 	ev := newEvent("a", "inv1", 1, "user", nil, &genai.Part{Text: "survives"})
-	got := s.formatEvents([]*session.Event{ev})
+	got := s.formatEvents([]*session.Event{ev}, s.maxToolContentChars)
 	if !strings.Contains(got, "survives") {
 		t.Errorf("transcript %q lost the real part next to the nil one", got)
+	}
+}
+
+// TestFormatEventsTruncatesTextParts checks that a text part is capped the same
+// way tool content is.
+//
+// Capping only tool content made the cost of the same payload depend on which
+// kind of part it arrived in, and text is not the more trustworthy of the two:
+// it carries pasted documents and tool results re-emitted as text.
+func TestFormatEventsTruncatesTextParts(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewLLMSummarizer(LLMSummarizerConfig{Model: &partialModel{}, MaxToolContentChars: 50})
+	if err != nil {
+		t.Fatalf("NewLLMSummarizer() error = %v", err)
+	}
+
+	huge := strings.Repeat("x", 5000)
+	ev := newEvent("a", "inv1", 1, "user", &genai.Part{Text: huge})
+	got := s.formatEvents([]*session.Event{ev}, s.maxToolContentChars)
+
+	if len(got) > 300 {
+		t.Errorf("a 5000-character text part rendered %d characters, so the cap does not apply to text", len(got))
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Errorf("transcript %q does not say it was truncated", got)
+	}
+}
+
+// TestSummarizeEventsRefusesAnOversizedTranscript checks that a window too big
+// to render within the budget is reported rather than silently trimmed.
+//
+// Trimming the oldest turns would be the obvious fix and is the wrong one: every
+// event in the window is inside the range the compaction records as covered, so
+// dropping them from the transcript while still deleting them from history would
+// lose them with nothing standing in their place.
+func TestSummarizeEventsRefusesAnOversizedTranscript(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewLLMSummarizer(LLMSummarizerConfig{
+		Model:               &partialModel{},
+		MaxToolContentChars: -1, // no per-part cap, so only the budget can bite
+		MaxTranscriptChars:  1000,
+	})
+	if err != nil {
+		t.Fatalf("NewLLMSummarizer() error = %v", err)
+	}
+
+	var events []*session.Event
+	for i := range 20 {
+		events = append(events, newEvent(fmt.Sprintf("e%d", i), "inv1", i+1, "user",
+			&genai.Part{Text: strings.Repeat("y", 500)}))
+	}
+
+	got, err := s.SummarizeEvents(t.Context(), events)
+	if err == nil {
+		t.Fatalf("SummarizeEvents() accepted an oversized transcript and returned %v, want an error", got)
+	}
+	if !strings.Contains(err.Error(), "smaller window") {
+		t.Errorf("error %q does not point at the remedy", err)
 	}
 }

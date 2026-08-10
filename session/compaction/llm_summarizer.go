@@ -50,6 +50,15 @@ const DefaultPromptTemplate = "The following is a conversation history between a
 // response is rendered into the summarizer prompt.
 const DefaultMaxToolContentChars = 2000
 
+// DefaultMaxTranscriptChars caps the whole rendered transcript handed to the
+// summarizer.
+//
+// Summarization is the one call that sees the entire window at once, so it is
+// the call most likely to exceed the model's own context limit, and the least
+// visible when it does. The cap is generous: reaching it means the window is
+// too large rather than that any one part is.
+const DefaultMaxTranscriptChars = 200_000
+
 // LLMSummarizerConfig configures [NewLLMSummarizer].
 type LLMSummarizerConfig struct {
 	// Model summarizes the conversation. Required.
@@ -60,10 +69,26 @@ type LLMSummarizerConfig struct {
 	// to [DefaultPromptTemplate].
 	PromptTemplate string
 
-	// MaxToolContentChars caps the rendered length of a single tool call's
-	// arguments or response. Defaults to [DefaultMaxToolContentChars]; a
-	// negative value disables truncation.
+	// MaxToolContentChars caps the rendered length of any single part of the
+	// transcript: a text part, a tool call's arguments, or a tool response.
+	// Defaults to [DefaultMaxToolContentChars]; a negative value disables
+	// truncation.
+	//
+	// It applies to text as well as tool content deliberately. Text parts carry
+	// pasted documents and tool results re-emitted as text, so capping only tool
+	// content made the cost of the same payload depend on which kind of part it
+	// arrived in.
 	MaxToolContentChars int
+
+	// MaxTranscriptChars caps the whole rendered transcript. Defaults to
+	// [DefaultMaxTranscriptChars]; a negative value disables the cap.
+	//
+	// Exceeding it is reported as an error rather than fixed by dropping the
+	// oldest turns. Those turns are inside the range the compaction would record
+	// as covered, so dropping them from the transcript while still deleting them
+	// from history would lose them outright. Declining costs a larger prompt;
+	// the remedy is a smaller window.
+	MaxTranscriptChars int
 
 	// GenerateContentConfig is applied to the summarization call.
 	//
@@ -91,6 +116,7 @@ type LLMSummarizer struct {
 	model               model.LLM
 	promptTemplate      string
 	maxToolContentChars int
+	maxTranscriptChars  int
 	genConfig           *genai.GenerateContentConfig
 }
 
@@ -108,6 +134,10 @@ func NewLLMSummarizer(cfg LLMSummarizerConfig) (*LLMSummarizer, error) {
 	if !strings.Contains(template, ConversationHistoryPlaceholder) {
 		return nil, fmt.Errorf("PromptTemplate must contain the placeholder %q", ConversationHistoryPlaceholder)
 	}
+	maxTranscript := cfg.MaxTranscriptChars
+	if maxTranscript == 0 {
+		maxTranscript = DefaultMaxTranscriptChars
+	}
 	maxChars := cfg.MaxToolContentChars
 	if maxChars == 0 {
 		maxChars = DefaultMaxToolContentChars
@@ -116,6 +146,7 @@ func NewLLMSummarizer(cfg LLMSummarizerConfig) (*LLMSummarizer, error) {
 		model:               cfg.Model,
 		promptTemplate:      template,
 		maxToolContentChars: maxChars,
+		maxTranscriptChars:  maxTranscript,
 		genConfig:           summarizerGenConfig(cfg.GenerateContentConfig),
 	}, nil
 }
@@ -126,7 +157,11 @@ func (s *LLMSummarizer) SummarizeEvents(ctx context.Context, events []*session.E
 		return nil, nil
 	}
 
-	prompt := strings.Replace(s.promptTemplate, ConversationHistoryPlaceholder, s.formatEvents(events), 1)
+	transcript, err := s.renderTranscript(events)
+	if err != nil {
+		return nil, err
+	}
+	prompt := strings.Replace(s.promptTemplate, ConversationHistoryPlaceholder, transcript, 1)
 	req := &model.LLMRequest{
 		Model:    s.model.Name(),
 		Contents: []*genai.Content{genai.NewContentFromText(prompt, genai.RoleUser)},
@@ -195,7 +230,7 @@ func hasText(c *genai.Content) bool {
 // inside the transcript, and the summarizer has no way to tell a forged turn
 // from a real one. Escaping keeps every rendered line attributable to the
 // author the framework recorded.
-func (s *LLMSummarizer) formatEvents(events []*session.Event) string {
+func (s *LLMSummarizer) formatEvents(events []*session.Event, cap int) string {
 	var lines []string
 	for _, ev := range events {
 		content := utils.Content(ev)
@@ -210,18 +245,18 @@ func (s *LLMSummarizer) formatEvents(events []*session.Event) string {
 			switch {
 			case p.Thought && p.Text != "":
 				if !isCompaction {
-					lines = append(lines, fmt.Sprintf("%s (thought): %s", ev.Author, escapeLines(p.Text)))
+					lines = append(lines, fmt.Sprintf("%s (thought): %s", ev.Author, escapeLines(s.truncateTo(p.Text, cap))))
 				}
 			case p.Text != "":
-				lines = append(lines, fmt.Sprintf("%s: %s", ev.Author, escapeLines(p.Text)))
+				lines = append(lines, fmt.Sprintf("%s: %s", ev.Author, escapeLines(s.truncateTo(p.Text, cap))))
 			}
 			if p.FunctionCall != nil {
 				lines = append(lines, fmt.Sprintf("%s called tool: %s(%s)",
-					ev.Author, p.FunctionCall.Name, escapeLines(s.truncate(stringify(p.FunctionCall.Args)))))
+					ev.Author, p.FunctionCall.Name, escapeLines(s.truncateTo(stringify(p.FunctionCall.Args), cap))))
 			}
 			if p.FunctionResponse != nil {
 				lines = append(lines, fmt.Sprintf("Tool response from %s: %s",
-					p.FunctionResponse.Name, escapeLines(s.truncate(stringify(p.FunctionResponse.Response)))))
+					p.FunctionResponse.Name, escapeLines(s.truncateTo(stringify(p.FunctionResponse.Response), cap))))
 			}
 			// Everything else gets a placeholder rather than nothing. Dropping
 			// the bytes of an image or a code-execution result is right, but
@@ -243,21 +278,21 @@ func (s *LLMSummarizer) formatEvents(events []*session.Event) string {
 // output far harder than the configured limit implies, since 2000 "chars" of
 // Japanese is about 666 actual characters of UTF-8. A byte slice can also land
 // mid-rune and emit invalid UTF-8 into the prompt.
-func (s *LLMSummarizer) truncate(text string) string {
-	if s.maxToolContentChars < 0 {
+func (s *LLMSummarizer) truncateTo(text string, cap int) string {
+	if cap < 0 {
 		return text
 	}
 	// A string never holds more runes than bytes, so text already within the
 	// limit by byte length needs no counting. This is the ASCII fast path.
-	if len(text) <= s.maxToolContentChars {
+	if len(text) <= cap {
 		return text
 	}
-	if utf8.RuneCountInString(text) <= s.maxToolContentChars {
+	if utf8.RuneCountInString(text) <= cap {
 		return text
 	}
 	runes := []rune(text)
 	return fmt.Sprintf("%s... [truncated %d chars]",
-		string(runes[:s.maxToolContentChars]), len(runes)-s.maxToolContentChars)
+		string(runes[:cap]), len(runes)-cap)
 }
 
 // stringify renders tool arguments and responses for the transcript.
@@ -339,4 +374,53 @@ func mimeOr(mimeType, fallback string) string {
 		return fallback
 	}
 	return mimeType + " attachment"
+}
+
+// renderTranscript renders events, keeping the result within the configured
+// transcript budget.
+//
+// A single oversized part is shrunk first, since one pasted document should not
+// cost the whole budget. If the transcript still does not fit, that is a window
+// too large rather than a part too large, and it is reported instead of
+// trimmed: every event here is inside the range the compaction would record as
+// covered, so dropping the oldest from the transcript while still deleting them
+// from history would lose them with nothing standing in their place.
+func (s *LLMSummarizer) renderTranscript(events []*session.Event) (string, error) {
+	transcript := s.formatEvents(events, s.maxToolContentChars)
+	if s.maxTranscriptChars < 0 || len(transcript) <= s.maxTranscriptChars {
+		return transcript, nil
+	}
+
+	// Second pass with a per-part cap derived from the budget, so a few large
+	// parts are shrunk rather than the whole window being refused.
+	if parts := countRenderedParts(events); parts > 0 {
+		if cap := s.maxTranscriptChars / parts; cap > 0 && cap < s.maxToolContentChars {
+			transcript = s.formatEvents(events, cap)
+		}
+	}
+	if len(transcript) <= s.maxTranscriptChars {
+		return transcript, nil
+	}
+	return "", fmt.Errorf("rendered transcript is %d characters, over the %d limit, for a window of %d events: compact a smaller window",
+		len(transcript), s.maxTranscriptChars, len(events))
+}
+
+// countRenderedParts counts the parts formatEvents would render a line for.
+func countRenderedParts(events []*session.Event) int {
+	n := 0
+	for _, ev := range events {
+		content := utils.Content(ev)
+		if content == nil {
+			continue
+		}
+		for _, p := range content.Parts {
+			if p == nil {
+				continue
+			}
+			if p.Text != "" || p.FunctionCall != nil || p.FunctionResponse != nil || isProse(p) {
+				n++
+			}
+		}
+	}
+	return n
 }

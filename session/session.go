@@ -211,6 +211,13 @@ type RequestInput struct {
 // Note: when multiple agents participate in one invocation, there could be
 // multiple events with IsFinalResponse() as True, for each participating agent.
 func (e *Event) IsFinalResponse() bool {
+	// A compaction event is bookkeeping rather than conversation: it carries a
+	// record and no content of its own. It satisfies every clause below, so
+	// without this a streaming client deciding what to show a user would surface
+	// an empty final response every time compaction ran.
+	if e.Actions.Compaction != nil {
+		return false
+	}
 	if (e.Actions.SkipSummarization) || len(e.LongRunningToolIDs) > 0 {
 		return true
 	}

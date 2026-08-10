@@ -146,3 +146,26 @@ func TestNewSummaryEventRejectsProselessSummary(t *testing.T) {
 		t.Error("NewSummaryEvent() accepted a summary with no prose, want an error rather than an empty summary")
 	}
 }
+
+// TestCompactionEventIsNotAFinalResponse checks that a stored summary does not
+// present itself to streaming consumers as an agent's final response.
+//
+// A compaction event carries a record and no content, which satisfies every
+// other clause of IsFinalResponse, so a client deciding what to show a user
+// would surface an empty final response every time compaction ran.
+func TestCompactionEventIsNotAFinalResponse(t *testing.T) {
+	t.Parallel()
+
+	events := []*session.Event{
+		{Timestamp: time.Unix(1, 0)},
+		{Timestamp: time.Unix(2, 0)},
+	}
+	got, err := NewSummaryEvent(events, genai.NewContentFromText("the summary", "model"), nil)
+	if err != nil {
+		t.Fatalf("NewSummaryEvent() error = %v", err)
+	}
+
+	if got.IsFinalResponse() {
+		t.Error("a compaction event reports IsFinalResponse() = true; streaming clients would show it as an empty reply")
+	}
+}
