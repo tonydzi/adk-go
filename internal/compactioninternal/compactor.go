@@ -17,6 +17,7 @@ package compactioninternal
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	"go.opentelemetry.io/otel/codes"
 
@@ -86,7 +87,7 @@ func summarizeTraced(ctx context.Context, cfg *compaction.Config, sess session.S
 	ctx, span := telemetry.StartCompactEventsSpan(ctx, telemetry.StartCompactEventsSpanParams{
 		Trigger:            trigger,
 		SessionID:          sessionID,
-		SummarizerType:     fmt.Sprintf("%T", cfg.Summarizer),
+		SummarizerType:     summarizerTypeName(cfg.Summarizer),
 		EventCount:         len(window),
 		CompactionInterval: cfg.CompactionInterval,
 		OverlapSize:        cfg.OverlapSize,
@@ -168,4 +169,25 @@ func collect(sess session.Session) []*session.Event {
 		events = append(events, ev)
 	}
 	return events
+}
+
+// summarizerTypeName is the bare type name of a Summarizer, without package
+// qualifier or pointer marker.
+//
+// The reference implementation puts type(summarizer).__name__ on this span, so
+// "LLMSummarizer" is what a consumer joining traces across implementations
+// expects to match against. Sprintf("%T") would emit
+// "*compaction.LLMSummarizer", which names a Go type rather than a summarizer.
+func summarizerTypeName(s compaction.Summarizer) string {
+	if s == nil {
+		return ""
+	}
+	t := reflect.TypeOf(s)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if name := t.Name(); name != "" {
+		return name
+	}
+	return t.String()
 }

@@ -28,10 +28,17 @@ import (
 
 const compactEventsName = "compact_events"
 
-// timestampLayout renders compaction range bounds. Event timestamps are
-// time.Time, and RFC 3339 with nanoseconds preserves their full precision while
-// staying readable in a trace viewer.
-const timestampLayout = time.RFC3339Nano
+// epochSeconds renders a compaction range bound the way the reference
+// implementation does.
+//
+// adk-python models these bounds as float seconds since the epoch and puts that
+// float straight on the span, so a consumer joining traces across the two
+// implementations has to see the same type under the same key. An RFC 3339
+// string would also carry the host's zone offset onto the wire and, with
+// fractional zeros stripped, would not even sort in time order.
+func epochSeconds(t time.Time) float64 {
+	return float64(t.UnixNano()) / float64(time.Second)
+}
 
 // Compaction trigger names. Each becomes the suffix of the span name, so a
 // trace distinguishes the two strategies at a glance.
@@ -141,7 +148,7 @@ func TraceCompactionResult(span trace.Span, params TraceCompactionResultParams) 
 	}
 	span.SetAttributes(
 		genAICompactionResultEventID.String(ev.ID),
-		genAICompactionStartTimestamp.String(ev.Actions.Compaction.StartTimestamp.Format(timestampLayout)),
-		genAICompactionEndTimestamp.String(ev.Actions.Compaction.EndTimestamp.Format(timestampLayout)),
+		genAICompactionStartTimestamp.Float64(epochSeconds(ev.Actions.Compaction.StartTimestamp)),
+		genAICompactionEndTimestamp.Float64(epochSeconds(ev.Actions.Compaction.EndTimestamp)),
 	)
 }

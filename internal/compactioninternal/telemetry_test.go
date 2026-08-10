@@ -82,7 +82,7 @@ func TestSlidingWindowEmitsSpan(t *testing.T) {
 		"gen_ai.operation.name":             "compact_events",
 		"gen_ai.conversation.id":            "sess",
 		"gen_ai.compaction.trigger":         "sliding_window",
-		"gen_ai.compaction.summarizer_type": "*compactioninternal.fakeSummarizer",
+		"gen_ai.compaction.summarizer_type": "fakeSummarizer",
 		"gen_ai.compaction.result_event_id": got.ID,
 	} {
 		if a[key].AsString() != want {
@@ -106,13 +106,16 @@ func TestSlidingWindowEmitsSpan(t *testing.T) {
 	// and it must be the right range in the right layout. Asserting only that
 	// the attributes are non-empty left the layout, the bound each one is
 	// sourced from, and the timestamps themselves all unprotected.
-	wantStart := at(1).Format(time.RFC3339Nano)
-	wantEnd := at(4).Format(time.RFC3339Nano)
-	if got := a["gen_ai.compaction.start_timestamp"].AsString(); got != wantStart {
-		t.Errorf("start_timestamp = %q, want %q", got, wantStart)
+	// Epoch seconds as a float, matching the reference implementation. The type
+	// is asserted as well as the value, because emitting these as strings is the
+	// defect this pins and a string attribute reads back as zero here.
+	wantStart := float64(at(1).UnixNano()) / float64(time.Second)
+	wantEnd := float64(at(4).UnixNano()) / float64(time.Second)
+	if got := a["gen_ai.compaction.start_timestamp"]; got.Type() != attribute.FLOAT64 || got.AsFloat64() != wantStart {
+		t.Errorf("start_timestamp = %v (%v), want %v (FLOAT64)", got.Emit(), got.Type(), wantStart)
 	}
-	if got := a["gen_ai.compaction.end_timestamp"].AsString(); got != wantEnd {
-		t.Errorf("end_timestamp = %q, want %q", got, wantEnd)
+	if got := a["gen_ai.compaction.end_timestamp"]; got.Type() != attribute.FLOAT64 || got.AsFloat64() != wantEnd {
+		t.Errorf("end_timestamp = %v (%v), want %v (FLOAT64)", got.Emit(), got.Type(), wantEnd)
 	}
 	if got := a["gen_ai.compaction.result_event_id"].AsString(); got == "" {
 		t.Error("result_event_id is empty, so a trace cannot be joined to the stored summary")
