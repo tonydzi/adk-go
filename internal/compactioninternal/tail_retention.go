@@ -181,7 +181,12 @@ func selectTailRetentionWindow(events []*session.Event, retentionSize int) []*se
 		}
 	}
 
-	window := longestSelfContainedPrefix(candidates[:firstRetained])
+	// A summary inherits the branch and isolation scope of what it covers, so
+	// the window has to be homogeneous in both. A slice of a multi-agent
+	// session routinely spans branches, and summarizing across one folds a
+	// sub-agent's content into a summary the parent can read, defeating the
+	// filters that keep those apart.
+	window := longestSelfContainedPrefix(trimToOneScope(candidates[:firstRetained]))
 	if len(window) == 0 {
 		return nil
 	}
@@ -193,12 +198,23 @@ func selectTailRetentionWindow(events []*session.Event, retentionSize int) []*se
 	// Seed the window with the previous summary, timestamped at the start of
 	// the range it covered. The new compaction therefore spans a strictly wider
 	// range, which subsumes the old one at prompt-build time.
+	//
+	// The seed carries the previous summary's branch and isolation scope. It
+	// stands in for events that had them, and leaving the scope empty would
+	// make every summary built on top of it universally visible.
 	prev := latest.Actions.Compaction
 	seed := &session.Event{
-		Author:      "model",
-		Timestamp:   prev.StartTimestamp,
-		Branch:      latest.Branch,
-		LLMResponse: model.LLMResponse{Content: prev.CompactedContent},
+		Author:         "model",
+		Timestamp:      prev.StartTimestamp,
+		Branch:         latest.Branch,
+		IsolationScope: latest.IsolationScope,
+		LLMResponse:    model.LLMResponse{Content: prev.CompactedContent},
+	}
+	if seed.Branch != window[0].Branch || seed.IsolationScope != window[0].IsolationScope {
+		// The rolling summary belongs to a different scope than the window that
+		// would extend it. Compact the window on its own rather than merging
+		// across the boundary.
+		return window
 	}
 	return append([]*session.Event{seed}, window...)
 }

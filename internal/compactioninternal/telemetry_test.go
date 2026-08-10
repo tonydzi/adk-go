@@ -427,7 +427,7 @@ func TestCompactionSpanRecordsTailRetentionThresholds(t *testing.T) {
 		t.Errorf("event_retention_size = %d, want 1", got)
 	}
 	// The knobs of the strategy that is not configured stay off the span.
-	if _, ok := a["gen_ai.compaction.interval"]; ok {
-		t.Error("interval attribute is present on a tail-retention span, want it omitted")
+	if _, ok := a["gen_ai.compaction.compaction_interval"]; ok {
+		t.Error("compaction_interval is present on a tail-retention span, want it omitted")
 	}
 }

@@ -17,6 +17,7 @@ package llminternal
 import (
 	"fmt"
 	"iter"
+	"log"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/internal/agent/compactionctx"
@@ -42,27 +43,80 @@ func CompactionRequestProcessor(ctx agent.InvocationContext, _ *model.LLMRequest
 		if !rt.Enabled() {
 			return
 		}
-		sess := ctx.Session()
-		if sess == nil {
+		if ctx.Session() == nil {
 			return
 		}
 
+		// Compact against the session underneath any wrapper an agent installed
+		// over it. A wrapper carries a synthetic first-turn seed that no store
+		// holds, and every session service type-asserts on its own concrete
+		// type, so appending a summary to one fails outright.
+		//
+		// Unwrapping rather than re-reading keeps object identity with the
+		// session the wrapper reads through, so the summary appended below
+		// reaches the prompt this processor runs ahead of. A freshly read
+		// session would be a different object and the summary would miss it.
+		sess := compactioninternal.UnwrapSession(ctx.Session())
+
+		// Compaction is an optimisation, so a cancelled or expired turn should
+		// not spend a model call on it.
+		if ctx.Err() != nil {
+			return
+		}
 		summary, err := compactioninternal.TailRetention(ctx, rt.Config, sess, promptTokenEstimator(ctx))
 		if err != nil {
 			// Surfaced rather than swallowed, unlike the post-invocation pass.
 			// Compaction fires here precisely because the prompt is already
 			// near the context limit, so continuing would most likely fail the
 			// model call anyway, with a far less informative error.
-			yield(nil, fmt.Errorf("%w: token-threshold: %w", compaction.ErrCompaction, err))
+			yield(nil, compactionFailure("token-threshold", err))
 			return
 		}
 		if summary == nil {
 			return
 		}
+
+		// Summarizing takes a model call, which is long enough for another
+		// invocation on this session to append inside the range just chosen.
+		// Read the stored session and abandon the summary if anything landed
+		// inside it. Skipping costs one wasted call, where recording it would
+		// silently drop those turns from every later prompt.
+		//
+		// The read is only a comparison. The append below still goes to sess,
+		// for the identity reason above.
+		if ctx.Err() != nil {
+			return
+		}
+		latest, err := compactioninternal.ReloadSession(ctx, rt.SessionService, sess)
+		if err != nil {
+			yield(nil, compactionFailure("token-threshold", err))
+			return
+		}
+		if compactioninternal.RangeRaced(latest, sess, summary) {
+			log.Printf("adk: discarding a tail-retention summary because the session changed inside its range while summarizing")
+			return
+		}
+
 		if err := rt.SessionService.AppendEvent(ctx, sess, summary); err != nil {
-			yield(nil, fmt.Errorf("%w: failed to append the summary event: %w", compaction.ErrCompaction, err))
+			yield(nil, compactionFailure("failed to append the summary event", err))
 		}
 	}
+}
+
+// compactionFailure marks err as a compaction failure at the named stage.
+//
+// The cause is rendered with %v rather than wrapped with %w, deliberately. This
+// error is yielded into the flow's error channel, which reaches the workflow
+// scheduler, and the scheduler tests for a context.Canceled chain before
+// anything else and drops the error when it finds one. A summarizer that failed
+// because its own context was cancelled would therefore end the turn with no
+// answer, no events and no error at all: the most confusing outcome available.
+//
+// Cutting the chain keeps the cause in the message and keeps the error matchable
+// as [compaction.ErrCompaction], at the cost of errors.Is against the cause. For
+// a bookkeeping failure that is the right way round.
+func compactionFailure(stage string, err error) error {
+	return fmt.Errorf("%w: %s: %v", compaction.ErrCompaction, stage, err)
 }
 
 // promptTokenEstimator returns a [compactioninternal.TokenCounter] that approximates

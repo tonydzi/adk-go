@@ -996,3 +996,54 @@ func TestRunnerBothStrategiesCoexist(t *testing.T) {
 		t.Error("no surviving compaction event; every summary was subsumed")
 	}
 }
+
+// cancelingSummarizer fails with an error that wraps context.Canceled, which is
+// what a summarizer whose own context died looks like.
+type cancelingSummarizer struct{}
+
+func (s *cancelingSummarizer) SummarizeEvents(_ context.Context, _ []*session.Event) (*session.Event, error) {
+	return nil, fmt.Errorf("summarizer model call failed: %w", context.Canceled)
+}
+
+// TestTailRetentionCancelledSummarizerStillSurfaces checks that a summarizer
+// failure caused by a cancelled context still reaches the caller.
+//
+// The tail-retention error rides the flow's error channel into the workflow
+// scheduler, and the scheduler tests for a context.Canceled chain before
+// anything else and drops the error when it finds one. Wrapping the cause with
+// %w therefore produced the worst possible outcome: no answer, no events and no
+// error either.
+func TestTailRetentionCancelledSummarizerStillSurfaces(t *testing.T) {
+	t.Parallel()
+
+	const userID, sessionID = "u", "s"
+
+	m := &usageModel{promptTokens: 5000}
+	r, _ := newCompactionRunner(t, m, &compaction.Config{
+		TokenThreshold:     100,
+		EventRetentionSize: 1,
+		Summarizer:         &cancelingSummarizer{},
+	})
+
+	drain(t, r.Run(t.Context(), userID, sessionID, genai.NewContentFromText("q1", genai.RoleUser), agent.RunConfig{}))
+
+	var gotErr error
+	events := 0
+	for _, err := range r.Run(t.Context(), userID, sessionID, genai.NewContentFromText("q2", genai.RoleUser), agent.RunConfig{}) {
+		if err != nil {
+			gotErr = err
+			break
+		}
+		events++
+	}
+
+	if gotErr == nil {
+		t.Fatalf("a cancelled summarizer produced no error at all (%d events yielded); the scheduler swallowed it", events)
+	}
+	if !errors.Is(gotErr, compaction.ErrCompaction) {
+		t.Errorf("error %v is not an ErrCompaction", gotErr)
+	}
+	if errors.Is(gotErr, context.Canceled) {
+		t.Errorf("error %v still carries context.Canceled in its chain, which is what the scheduler drops on", gotErr)
+	}
+}

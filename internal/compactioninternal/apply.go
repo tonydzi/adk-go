@@ -15,6 +15,8 @@
 package compactioninternal
 
 import (
+	"context"
+	"fmt"
 	"slices"
 
 	"google.golang.org/adk/v2/internal/utils"
@@ -327,4 +329,67 @@ func RangeRaced(latest, selectedFrom session.Session, summary *session.Event) bo
 		}
 	}
 	return false
+}
+
+// ReloadSession re-reads s from svc and returns the stored session.
+//
+// Compaction must not run against the session handle it was handed. That handle
+// is a snapshot taken before the work started, so a concurrent invocation on the
+// same session may have appended events it cannot see, and summarizing against
+// it records a range covering those events without having summarized them. It
+// may also be a wrapper that an agent installed over the real session, and every
+// session service type-asserts on its own concrete type, so appending to a
+// wrapper fails.
+//
+// Re-reading solves both: the result is current, and it is whatever concrete
+// type the service issues.
+func ReloadSession(ctx context.Context, svc session.Service, s session.Session) (session.Session, error) {
+	if svc == nil || s == nil {
+		return nil, fmt.Errorf("cannot re-read the session: no session service")
+	}
+	resp, err := svc.Get(ctx, &session.GetRequest{
+		AppName:   s.AppName(),
+		UserID:    s.UserID(),
+		SessionID: s.ID(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-read the session: %w", err)
+	}
+	if resp == nil || resp.Session == nil {
+		return nil, fmt.Errorf("session %q disappeared while compacting", s.ID())
+	}
+	return resp.Session, nil
+}
+
+// sessionUnwrapper is implemented by a [session.Session] that decorates another
+// one. Nothing in the public API exposes it: the decorators are unexported types
+// that happen to carry the method.
+type sessionUnwrapper interface {
+	Unwrap() session.Session
+}
+
+// UnwrapSession returns the innermost session s decorates, or s itself.
+//
+// An agent may wrap the session it hands to a sub-agent so the sub-agent's
+// prompt sees a synthetic first-turn seed. That wrapper is fine to read through
+// but must not be compacted against: every session service type-asserts on its
+// own concrete type, so appending to a wrapper fails outright, and the seed is
+// not durable, so recording a range over it would cover an event no store holds.
+//
+// Unwrapping rather than re-reading is deliberate. It preserves object identity
+// with the session the wrapper delegates to, so an event appended here is
+// visible through the wrapper immediately. A freshly read session would be a
+// different object, and the summary would not reach the prompt being assembled.
+func UnwrapSession(s session.Session) session.Session {
+	for {
+		w, ok := s.(sessionUnwrapper)
+		if !ok {
+			return s
+		}
+		inner := w.Unwrap()
+		if inner == nil {
+			return s
+		}
+		s = inner
+	}
 }

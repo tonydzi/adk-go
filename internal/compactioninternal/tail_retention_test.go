@@ -501,3 +501,34 @@ func TestTailRetentionThenApplyShrinksHistory(t *testing.T) {
 		t.Errorf("first prompt event = %v, want the summary text", texts)
 	}
 }
+
+// TestSelectTailRetentionWindowStaysInOneScope checks that the tail window stops
+// at the first branch or isolation-scope change.
+//
+// A summary inherits the branch and isolation scope of what it covers, so a
+// window spanning two of them produces one summary that necessarily misattributes
+// half its content. Stamped with the first event's scope, it becomes readable by
+// agents the filters exist to keep the rest away from.
+func TestSelectTailRetentionWindowStaysInOneScope(t *testing.T) {
+	t.Parallel()
+
+	root1 := textEvent("a", "inv1", 1, "q1")
+	root2 := modelTextEvent("b", "inv1", 2, "a1")
+	sub := textEvent("c", "inv2", 3, "SUB-AGENT-SECRET")
+	sub.Branch = "root.sub"
+	sub.IsolationScope = "scope-1"
+	tail1 := textEvent("d", "inv3", 4, "q3")
+	tail2 := modelTextEvent("e", "inv3", 5, "a3")
+
+	events := []*session.Event{root1, root2, sub, tail1, tail2}
+
+	window := selectTailRetentionWindow(events, 2)
+	if diff := cmp.Diff([]string{"a", "b"}, ids(window)); diff != "" {
+		t.Errorf("selectTailRetentionWindow() mismatch (-want +got):\n%s\nthe window must stop at the scope change", diff)
+	}
+	for _, ev := range window {
+		if ev.Branch != "" || ev.IsolationScope != "" {
+			t.Errorf("event %q carries branch %q scope %q, so the window is not homogeneous", ev.ID, ev.Branch, ev.IsolationScope)
+		}
+	}
+}
