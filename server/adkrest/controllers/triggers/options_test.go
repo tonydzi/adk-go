@@ -74,3 +74,26 @@ func TestWithEventsCompactionConfigDefaultsToNil(t *testing.T) {
 		t.Errorf("eventsCompactionConfig = %v, want nil when the option is not supplied", c.runner.eventsCompactionConfig)
 	}
 }
+
+// TestControllerOptionsToleratesNil checks that a nil option is skipped rather
+// than dereferenced.
+//
+// Options are commonly assembled by a helper that returns nil when it has
+// nothing to apply, and a variadic parameter makes passing one easy. Panicking
+// during construction is a poor way to report that.
+func TestControllerOptionsToleratesNil(t *testing.T) {
+	t.Parallel()
+
+	if got := NewPubSubController(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil); got == nil {
+		t.Error("NewPubSubController() with a nil option returned nil")
+	}
+	if got := NewEventarcController(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil); got == nil {
+		t.Error("NewEventarcController() with a nil option returned nil")
+	}
+	// A nil option alongside a real one must not stop the real one applying.
+	cfg := &compaction.Config{CompactionInterval: 2}
+	c := NewPubSubController(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil, WithEventsCompactionConfig(cfg))
+	if c.runner.eventsCompactionConfig != cfg {
+		t.Error("a nil option prevented a later option from applying")
+	}
+}

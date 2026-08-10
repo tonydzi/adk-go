@@ -67,6 +67,12 @@ func WithEventsCompactionConfig(cfg *compaction.Config) RuntimeAPIOption {
 func NewRuntimeAPIController(sessionService session.Service, memoryService memory.Service, agentLoader agent.Loader, artifactService artifact.Service, sseTimeout time.Duration, pluginConfig runner.PluginConfig, autoCreateSession bool, opts ...RuntimeAPIOption) *RuntimeAPIController {
 	c := &RuntimeAPIController{sessionService: sessionService, memoryService: memoryService, agentLoader: agentLoader, artifactService: artifactService, sseTimeout: sseTimeout, pluginConfig: pluginConfig, autoCreateSession: autoCreateSession}
 	for _, opt := range opts {
+		// A nil option is a caller mistake, not a reason to panic during
+		// construction: options are commonly built by a helper that returns nil
+		// when it has nothing to apply.
+		if opt == nil {
+			continue
+		}
 		opt(c)
 	}
 	return c

@@ -46,6 +46,11 @@ func NewPubSubController(sessionService session.Service, agentLoader agent.Loade
 		triggerConfig:   triggerConfig,
 	}
 	for _, opt := range opts {
+		// See NewRuntimeAPIController: a nil option is skipped rather than
+		// dereferenced.
+		if opt == nil {
+			continue
+		}
 		opt(retriable)
 	}
 	return &PubSubController{

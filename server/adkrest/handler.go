@@ -36,6 +36,14 @@ import (
 
 // NewServer creates a new ADK REST API server which implements [http.Handler] interface.
 func NewServer(cfg ServerConfig) (*Server, error) {
+	// Validated here rather than left to the first request. A compaction config
+	// is rejected inside runner.New, which this server calls per request, so an
+	// invalid one would otherwise start cleanly and then fail every request
+	// with a 500 that names nothing the operator can act on.
+	if err := cfg.EventsCompactionConfig.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid EventsCompactionConfig: %w", err)
+	}
+
 	debugTelemetry, err := services.NewDebugTelemetryWithConfig(&services.DebugTelemetryConfig{
 		TraceCapacity: cfg.DebugConfig.TraceCapacity,
 	})

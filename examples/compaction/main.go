@@ -22,14 +22,19 @@
 //   - Sliding window fires after every CompactionInterval completed turns.
 //   - Tail retention fires mid-turn, once a prompt reaches TokenThreshold.
 //
-// Setting EventsCompactionConfig on [launcher.Config] enables compaction for
-// every surface the launcher serves: the console, the web UI, A2A and Agent
-// Engine.
+// Setting EventsCompactionConfig on [launcher.Config] enables compaction on
+// every surface that reads that config. The launcher used here, full.NewLauncher,
+// serves the console, the web UI, A2A, the Pub/Sub and Eventarc triggers, and
+// the REST API. Agent Engine reads the same field but is served by its own
+// handler rather than by this launcher.
 //
 // Run it and hold a conversation of several turns:
 //
 //	GOOGLE_API_KEY=... go run ./examples/compaction console
-//	GOOGLE_API_KEY=... go run ./examples/compaction web
+//	GOOGLE_API_KEY=... go run ./examples/compaction web webui
+//
+// The web command needs at least one sublauncher named after it, as above.
+// Running it bare exits with "no active sublaunchers found".
 //
 // After every two turns a compaction event is appended to the session, and the
 // turns it covers stop being sent to the model. The summary is bookkeeping

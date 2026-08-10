@@ -47,6 +47,11 @@ func NewEventarcController(sessionService session.Service, agentLoader agent.Loa
 		triggerConfig:   triggerConfig,
 	}
 	for _, opt := range opts {
+		// See NewRuntimeAPIController: a nil option is skipped rather than
+		// dereferenced.
+		if opt == nil {
+			continue
+		}
 		opt(retriable)
 	}
 	return &EventarcController{

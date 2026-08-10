@@ -212,3 +212,33 @@ func compactionPromptText(contents []*genai.Content) string {
 	}
 	return b.String()
 }
+
+// TestNewServerRejectsInvalidCompactionConfig checks that an unusable
+// compaction config stops the server starting.
+//
+// runner.New validates the config, and the server builds a runner per request,
+// so without a check at construction an invalid config produces a server that
+// starts cleanly and then fails every request with a 500. The operator sees a
+// broken deployment rather than a refused start naming the field.
+func TestNewServerRejectsInvalidCompactionConfig(t *testing.T) {
+	t.Parallel()
+
+	m := &echoModel{}
+	root, err := llmagent.New(llmagent.Config{Name: "assistant", Model: m})
+	if err != nil {
+		t.Fatalf("llmagent.New() error = %v", err)
+	}
+
+	_, err = adkrest.NewServer(adkrest.ServerConfig{
+		SessionService: session.InMemoryService(),
+		AgentLoader:    agent.NewSingleLoader(root),
+		// Overlap without an interval: sliding-window compaction can never run.
+		EventsCompactionConfig: &compaction.Config{OverlapSize: 2},
+	})
+	if err == nil {
+		t.Fatal("NewServer() accepted an invalid EventsCompactionConfig, want it refused at startup")
+	}
+	if !strings.Contains(err.Error(), "EventsCompactionConfig") {
+		t.Errorf("error %q does not name the offending field", err)
+	}
+}

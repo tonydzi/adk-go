@@ -37,6 +37,13 @@ import (
 // NewHandler creates and returns an http.Handler for the AgentEngine API.
 // Handles both streaming and non-streaming versions
 func NewHandler(config *launcher.Config, sseWriteTimeout time.Duration, maxPayloadSize int64, agentEngineID string) (http.Handler, error) {
+	// Validated here rather than left to the first request. A compaction config
+	// is rejected inside runner.New, which the request handlers call, so an
+	// invalid one would otherwise start cleanly and then fail every request.
+	if err := config.EventsCompactionConfig.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid EventsCompactionConfig: %w", err)
+	}
+
 	router := mux.NewRouter().StrictSlash(true)
 
 	nonStreamAgentEngineController, err := controllers.NewAgentEngineAPIController(config.SessionService, sseWriteTimeout, maxPayloadSize,
