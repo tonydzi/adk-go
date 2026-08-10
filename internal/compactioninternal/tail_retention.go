@@ -64,6 +64,12 @@ func TailRetention(ctx context.Context, cfg *compaction.Config, sess session.Ses
 
 	window := selectTailRetentionWindow(events, cfg.EventRetentionSize)
 	if len(window) == 0 {
+		// The threshold is crossed and nothing can be summarized: the retained
+		// tail is the whole history, or the window has no self-contained prefix
+		// because a tool call at its head is still unanswered. Silence here is
+		// indistinguishable from an idle session, while the prompt keeps growing
+		// on every turn, so it is recorded.
+		traceDeclined(ctx, cfg, sess, telemetry.CompactionTriggerTokenThreshold, "no compactable window past the retained tail")
 		return nil, nil
 	}
 
@@ -90,6 +96,14 @@ const charsPerToken = 4
 // treat as "do not compact yet".
 func promptTokenCount(events []*session.Event, estimate TokenCounter) (int, bool) {
 	for i := len(events) - 1; i >= 0; i-- {
+		// Skip compaction events. A summary carries the usage metadata of the
+		// summarizer's own call, which measures the transcript it was handed
+		// rather than the agent's prompt. Reading it latches compaction on: the
+		// summarizer's count is typically far above the threshold, so every
+		// later turn sees the threshold crossed and compacts again.
+		if hasCompaction(events[i]) {
+			continue
+		}
 		if usage := events[i].UsageMetadata; usage != nil && usage.PromptTokenCount > 0 {
 			return int(usage.PromptTokenCount), true
 		}

@@ -56,6 +56,7 @@ var (
 	genAICompactionEventRetention = attribute.Key("gen_ai.compaction.event_retention_size")
 	genAICompactionInterval       = attribute.Key("gen_ai.compaction.compaction_interval")
 	genAICompactionOverlapSize    = attribute.Key("gen_ai.compaction.overlap_size")
+	genAICompactionDeclined       = attribute.Key("gen_ai.compaction.declined")
 	genAICompactionResultEventID  = attribute.Key("gen_ai.compaction.result_event_id")
 	genAICompactionStartTimestamp = attribute.Key("gen_ai.compaction.start_timestamp")
 	genAICompactionEndTimestamp   = attribute.Key("gen_ai.compaction.end_timestamp")
@@ -167,4 +168,16 @@ func TraceCompactionResult(span trace.Span, params TraceCompactionResultParams) 
 		genAICompactionStartTimestamp.Float64(epochSeconds(ev.Actions.Compaction.StartTimestamp)),
 		genAICompactionEndTimestamp.Float64(epochSeconds(ev.Actions.Compaction.EndTimestamp)),
 	)
+}
+
+// TraceCompactionDeclined records a compaction that fired but could not run.
+//
+// The span carries the same attributes as one that did run, plus the reason, so
+// "the threshold is crossed and nothing can be done about it" is visible rather
+// than looking exactly like an idle session. The attribute has no counterpart in
+// the reference implementation, which emits nothing for this state at all.
+func TraceCompactionDeclined(ctx context.Context, params StartCompactEventsSpanParams, reason string) {
+	_, span := StartCompactEventsSpan(ctx, params)
+	span.SetAttributes(genAICompactionDeclined.String(reason))
+	span.End()
 }

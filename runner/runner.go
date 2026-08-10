@@ -235,6 +235,14 @@ func (r *Runner) compactAfterInvocation(ctx context.Context, storedSession sessi
 	if !compactioninternal.HasSlidingWindow(r.compactionConfig) {
 		return nil
 	}
+	// Tail retention may already have compacted this turn from inside the
+	// invocation. Summarizing again the moment it ends would pay for a second
+	// model call to re-summarize what was just summarized, and would leave two
+	// ranges over the same span. The reference implementation reaches the same
+	// outcome by evaluating both strategies in one place and returning early.
+	if compactionctx.FromContext(ctx).AlreadyCompacted() {
+		return nil
+	}
 	// Compaction is an optimisation, so a cancelled or expired run should not
 	// spend a model call on it, nor write a summary the caller never waited
 	// for.

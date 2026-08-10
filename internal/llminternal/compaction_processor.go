@@ -15,6 +15,7 @@
 package llminternal
 
 import (
+	"context"
 	"fmt"
 	"iter"
 	"log"
@@ -65,11 +66,7 @@ func CompactionRequestProcessor(ctx agent.InvocationContext, _ *model.LLMRequest
 		}
 		summary, err := compactioninternal.TailRetention(ctx, rt.Config, sess, promptTokenEstimator(ctx))
 		if err != nil {
-			// Surfaced rather than swallowed, unlike the post-invocation pass.
-			// Compaction fires here precisely because the prompt is already
-			// near the context limit, so continuing would most likely fail the
-			// model call anyway, with a far less informative error.
-			yield(nil, compactionFailure("token-threshold", err))
+			degrade(ctx, "token-threshold", err)
 			return
 		}
 		if summary == nil {
@@ -98,9 +95,32 @@ func CompactionRequestProcessor(ctx agent.InvocationContext, _ *model.LLMRequest
 		}
 
 		if err := rt.SessionService.AppendEvent(ctx, sess, summary); err != nil {
-			yield(nil, compactionFailure("failed to append the summary event", err))
+			degrade(ctx, "failed to append the summary event", err)
+			return
 		}
+		// The post-invocation sliding window checks this and stands down, so a
+		// turn that was compacted mid-flight is not summarized twice.
+		rt.MarkCompacted()
 	}
+}
+
+// degrade reports a failed mid-turn compaction and lets the turn continue.
+//
+// This runs before a model call, in the middle of an invocation whose tools may
+// already have run and committed their side effects. Failing the turn for a
+// failed optimisation is never the right trade there: the user loses an answer,
+// the side effects stand, and any summary already written is orphaned. Letting
+// it through costs a larger prompt, and the model call either succeeds anyway,
+// because the threshold sits well below the real context limit, or fails with
+// the provider's own error, which says more about the actual problem than a
+// compaction error would.
+//
+// The failure is not lost. It is logged, and the compaction span records it
+// with an error status, so a summarizer failing every call is visible in traces
+// rather than only in an aborted turn. The post-invocation pass still surfaces
+// its own failures to the caller, since nothing is mid-flight there.
+func degrade(ctx context.Context, stage string, err error) {
+	log.Printf("adk: %v; continuing with an uncompacted prompt", compactionFailure(stage, err))
 }
 
 // compactionFailure marks err as a compaction failure at the named stage.

@@ -912,12 +912,21 @@ func TestRunnerTailRetentionRespectsThreshold(t *testing.T) {
 	}
 }
 
-func TestRunnerTailRetentionFailureAbortsTheTurn(t *testing.T) {
+// TestRunnerTailRetentionFailureDoesNotAbortTheTurn checks that a mid-turn
+// compaction failure degrades to a larger prompt rather than killing the turn.
+//
+// Tail retention runs before a model call, inside an invocation whose tools may
+// already have run and committed their side effects. Aborting there costs the
+// user an answer, leaves the side effects standing, and orphans any summary
+// already written, all to report that an optimisation did not happen. The
+// threshold sits well below the real context limit, so the call usually still
+// succeeds; when it does not, the provider's own error says more.
+func TestRunnerTailRetentionFailureDoesNotAbortTheTurn(t *testing.T) {
 	t.Parallel()
 
 	const userID, sessionID = "u", "s"
 	m := &usageModel{promptTokens: 5000}
-	r, _ := newCompactionRunner(t, m, &compaction.Config{
+	r, svc := newCompactionRunner(t, m, &compaction.Config{
 		TokenThreshold:     1000,
 		EventRetentionSize: 1,
 		Summarizer:         failingSummarizer{},
@@ -925,21 +934,26 @@ func TestRunnerTailRetentionFailureAbortsTheTurn(t *testing.T) {
 
 	drain(t, r.Run(t.Context(), userID, sessionID, genai.NewContentFromText("q1", genai.RoleUser), agent.RunConfig{}))
 
-	// Second turn trips the threshold, and the summarizer fails. Unlike the
-	// post-invocation pass, this surfaces: the prompt is already near the
-	// context limit, so silently continuing would fail less informatively.
+	// The second turn trips the threshold and the summarizer fails.
 	var gotErr error
+	events := 0
 	for _, err := range r.Run(t.Context(), userID, sessionID, genai.NewContentFromText("q2", genai.RoleUser), agent.RunConfig{}) {
 		if err != nil {
 			gotErr = err
 			break
 		}
+		events++
 	}
-	if gotErr == nil {
-		t.Fatal("run succeeded despite a failing tail-retention summarizer, want the error surfaced")
+	if gotErr != nil {
+		t.Errorf("a failed mid-turn compaction aborted the turn: %v", gotErr)
 	}
-	if !errors.Is(gotErr, compaction.ErrCompaction) {
-		t.Errorf("error %v is not an ErrCompaction, so a caller cannot tell it from a failed turn", gotErr)
+	if events == 0 {
+		t.Error("the turn produced no events, so the user got no answer")
+	}
+	// Nothing was recorded, so the next turn tries again rather than believing
+	// history was compacted.
+	if got := len(compactionEventsIn(getSession(t, svc, userID, sessionID))); got != 0 {
+		t.Errorf("stored %d compaction events despite the summarizer failing", got)
 	}
 }
 
@@ -948,8 +962,9 @@ func TestRunnerBothStrategiesCoexist(t *testing.T) {
 
 	const userID, sessionID = "u", "s"
 	// Both triggers are armed: tail retention fires mid-turn on the reported
-	// token count, sliding window fires after every completed turn. Neither is
-	// gated on the other, so this exercises the interleaving.
+	// token count, sliding window fires after every completed turn. A turn
+	// compacted mid-flight is not compacted again when it ends, so this
+	// exercises the hand-off between the two.
 	m := &usageModel{promptTokens: 5000}
 	summarizer := &recordingSummarizer{summary: "SUMMARY"}
 	r, svc := newCompactionRunner(t, m, &compaction.Config{
@@ -1005,15 +1020,14 @@ func (s *cancelingSummarizer) SummarizeEvents(_ context.Context, _ []*session.Ev
 	return nil, fmt.Errorf("summarizer model call failed: %w", context.Canceled)
 }
 
-// TestTailRetentionCancelledSummarizerStillSurfaces checks that a summarizer
-// failure caused by a cancelled context still reaches the caller.
+// TestTailRetentionCancelledSummarizerLeavesTheTurnIntact covers the case that
+// used to produce the worst possible outcome.
 //
-// The tail-retention error rides the flow's error channel into the workflow
-// scheduler, and the scheduler tests for a context.Canceled chain before
-// anything else and drops the error when it finds one. Wrapping the cause with
-// %w therefore produced the worst possible outcome: no answer, no events and no
-// error either.
-func TestTailRetentionCancelledSummarizerStillSurfaces(t *testing.T) {
+// A summarizer failing on a cancelled context yielded an error whose chain
+// contained context.Canceled, and the workflow scheduler drops those, so the
+// turn ended with no answer, no events and no error either. Mid-turn compaction
+// failures are no longer yielded at all, so the turn simply runs on.
+func TestTailRetentionCancelledSummarizerLeavesTheTurnIntact(t *testing.T) {
 	t.Parallel()
 
 	const userID, sessionID = "u", "s"
@@ -1036,14 +1050,58 @@ func TestTailRetentionCancelledSummarizerStillSurfaces(t *testing.T) {
 		}
 		events++
 	}
+	if gotErr != nil {
+		t.Errorf("unexpected error from the turn: %v", gotErr)
+	}
+	if events == 0 {
+		t.Fatal("the turn produced no events and no error, which is the empty-turn outcome this guards against")
+	}
+}
 
-	if gotErr == nil {
-		t.Fatalf("a cancelled summarizer produced no error at all (%d events yielded); the scheduler swallowed it", events)
+// TestTailRetentionStandsDownTheSlidingWindow checks that a turn compacted
+// mid-flight is not summarized a second time the moment it ends.
+//
+// The two strategies are independent triggers on the same history. Without a
+// hand-off, a turn that crossed the token threshold pays for a second model
+// call to re-summarize what was just summarized, and leaves two ranges over
+// overlapping spans. The reference implementation avoids this by evaluating
+// both in one place and returning early; here the mid-turn pass records that it
+// ran and the post-invocation pass stands down.
+func TestTailRetentionStandsDownTheSlidingWindow(t *testing.T) {
+	t.Parallel()
+
+	const userID, sessionID = "u", "s"
+
+	// Tuned so both strategies want to fire on the same turn, which is the only
+	// arrangement that exercises the hand-off. Interval 2 keeps the sliding
+	// window quiet on turn 1 so history can accumulate; by turn 2 there are
+	// three events, which is more than the retained tail, so tail retention
+	// fires mid-turn, and two completed invocations, so the sliding window
+	// would fire the moment the turn ends.
+	m := &usageModel{promptTokens: 5000}
+	summarizer := &recordingSummarizer{summary: "SUMMARY"}
+	r, svc := newCompactionRunner(t, m, &compaction.Config{
+		TokenThreshold:     1000,
+		EventRetentionSize: 2,
+		CompactionInterval: 2,
+		Summarizer:         summarizer,
+	})
+
+	perTurn := make([]int, 0, 2)
+	prev := 0
+	for i := range 2 {
+		drain(t, r.Run(t.Context(), userID, sessionID,
+			genai.NewContentFromText(fmt.Sprintf("q%d", i), genai.RoleUser), agent.RunConfig{}))
+		perTurn = append(perTurn, summarizer.calls()-prev)
+		prev = summarizer.calls()
 	}
-	if !errors.Is(gotErr, compaction.ErrCompaction) {
-		t.Errorf("error %v is not an ErrCompaction", gotErr)
+
+	// Turn 1 compacts nothing. Turn 2 compacts exactly once: tail retention
+	// mid-flight, and then the sliding window stands down.
+	if perTurn[0] != 0 || perTurn[1] != 1 {
+		t.Errorf("summarizer calls per turn = %v, want [0 1]: the second turn was compacted twice", perTurn)
 	}
-	if errors.Is(gotErr, context.Canceled) {
-		t.Errorf("error %v still carries context.Canceled in its chain, which is what the scheduler drops on", gotErr)
+	if got := len(compactionEventsIn(getSession(t, svc, userID, sessionID))); got != 1 {
+		t.Errorf("stored %d compaction events, want 1", got)
 	}
 }

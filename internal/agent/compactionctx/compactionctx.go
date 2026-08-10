@@ -24,6 +24,7 @@ package compactionctx
 
 import (
 	"context"
+	"sync/atomic"
 
 	"google.golang.org/adk/v2/internal/compactioninternal"
 	"google.golang.org/adk/v2/session"
@@ -37,6 +38,32 @@ type Runtime struct {
 	Config *compaction.Config
 	// SessionService persists the summary events the compactor produces.
 	SessionService session.Service
+
+	// compacted records that a compaction already ran in this invocation. A
+	// Runtime is built per invocation, so it is the right scope for this, and
+	// it is atomic because sub-agents running in parallel share one.
+	compacted atomic.Bool
+}
+
+// MarkCompacted records that a compaction ran during this invocation.
+func (rt *Runtime) MarkCompacted() {
+	if rt == nil {
+		return
+	}
+	rt.compacted.Store(true)
+}
+
+// AlreadyCompacted reports whether a compaction ran during this invocation.
+//
+// The two strategies are independent triggers on the same history, so without
+// this a turn that crossed the token threshold mid-flight would be summarized
+// again by the sliding window the moment it ended, paying for a second model
+// call to re-summarize what was just summarized. The reference implementation
+// avoids it by evaluating the two in one place and returning early; the same
+// effect is reached here by remembering, since the two run at different points
+// in the turn.
+func (rt *Runtime) AlreadyCompacted() bool {
+	return rt != nil && rt.compacted.Load()
 }
 
 // Configured reports whether compaction is enabled for this run.

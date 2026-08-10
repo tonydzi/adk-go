@@ -431,3 +431,44 @@ func TestCompactionSpanRecordsTailRetentionThresholds(t *testing.T) {
 		t.Error("compaction_interval is present on a tail-retention span, want it omitted")
 	}
 }
+
+// TestCompactionSpanRecordsADecline pins the difference between a trigger that
+// never fired and one that fired and could do nothing.
+//
+// The first stays silent, so a span in a trace still means compaction was
+// wanted. The second used to be silent too, which made a session whose prompt
+// grows on every turn look exactly like an idle one.
+func TestCompactionSpanRecordsADecline(t *testing.T) {
+	exp := spanRecorder(t)
+
+	// Threshold crossed, but the retained tail is the entire history, so there
+	// is nothing the compactor may summarize.
+	events := []*session.Event{
+		textEvent("a", "inv1", 1, "q1"), modelTextEvent("b", "inv1", 2, "a1"),
+	}
+	cfg := &compaction.Config{
+		TokenThreshold:     10,
+		EventRetentionSize: 50,
+		Summarizer:         &fakeSummarizer{summary: "SUM"},
+	}
+
+	got, err := TailRetention(context.Background(), cfg, &staticSession{events: events}, func([]*session.Event) int { return 1000 })
+	if err != nil || got != nil {
+		t.Fatalf("TailRetention() = (%v, %v), want (nil, nil)", got, err)
+	}
+
+	spans := exp.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans for a declined compaction, want 1", len(spans))
+	}
+	reason, ok := attrs(spans[0].Attributes)["gen_ai.compaction.declined"]
+	if !ok {
+		t.Fatal("the span does not say it declined, so it is indistinguishable from one that compacted")
+	}
+	if reason.AsString() == "" {
+		t.Error("the decline reason is empty")
+	}
+	if n := attrs(spans[0].Attributes)["gen_ai.compaction.event_count"].AsInt64(); n != 0 {
+		t.Errorf("event_count = %d on a declined compaction, want 0", n)
+	}
+}

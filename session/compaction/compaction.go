@@ -115,8 +115,11 @@ type Config struct {
 	TokenThreshold int
 
 	// EventRetentionSize is how many of the most recent events are kept raw
-	// when tail-retention compaction fires; everything older is summarized.
-	// Only meaningful alongside TokenThreshold.
+	// when tail-retention compaction fires. Everything older is summarized.
+	// Only meaningful alongside TokenThreshold, and required with it: at zero
+	// the window would extend to the newest event, which includes the question
+	// the model is about to answer, so the turn in progress would be summarized
+	// out of its own prompt.
 	EventRetentionSize int
 
 	// Summarizer produces the summary content. When nil, the runner supplies an
@@ -159,6 +162,9 @@ func (c *Config) Validate() error {
 	}
 	if c.OverlapSize > 0 && c.CompactionInterval == 0 {
 		return fmt.Errorf("OverlapSize is set to %d but CompactionInterval is 0, so sliding-window compaction never runs", c.OverlapSize)
+	}
+	if c.TokenThreshold > 0 && c.EventRetentionSize == 0 {
+		return fmt.Errorf("TokenThreshold is set to %d but EventRetentionSize is 0, so a compaction would summarize the whole conversation including the turn being answered", c.TokenThreshold)
 	}
 	if c.EventRetentionSize > 0 && c.TokenThreshold == 0 {
 		return fmt.Errorf("EventRetentionSize is set to %d but TokenThreshold is 0, so tail-retention compaction never runs", c.EventRetentionSize)

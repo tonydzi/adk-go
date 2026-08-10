@@ -76,6 +76,13 @@ func (r *Runner) runNode(
 	// be summarized: the window would hold a question with no answer, and that
 	// summary is stored permanently and degrades every later prompt. Observing
 	// it here, rather than at each error site, means no path can forget to.
+	// One compaction runtime for the whole invocation, attached before both the
+	// invocation context and the post-invocation hook are built from this ctx.
+	// Allocating it inside newNodeInvocationContext instead gave the mid-turn
+	// processor a different instance from the one this function reads, so the
+	// "already compacted" hand-off between the two strategies never arrived.
+	ctx = compactionctx.ToContext(ctx, r.compactionRuntime())
+
 	invocationFailed := false
 	emit := yield
 	yield = func(ev *session.Event, err error) bool {
@@ -265,7 +272,6 @@ func (r *Runner) newNodeInvocationContext(
 		StreamingMode: runconfig.StreamingMode(cfg.StreamingMode),
 	})
 	ctx = plugininternal.ToContext(ctx, r.pluginManager)
-	ctx = compactionctx.ToContext(ctx, r.compactionRuntime())
 
 	var artifacts agent.Artifacts
 	if r.artifactService != nil {
