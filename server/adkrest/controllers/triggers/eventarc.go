@@ -37,7 +37,17 @@ type EventarcController struct {
 }
 
 // NewEventarcController creates a new EventarcController.
-func NewEventarcController(sessionService session.Service, agentLoader agent.Loader, memoryService memory.Service, artifactService artifact.Service, pluginConfig runner.PluginConfig, triggerConfig TriggerConfig, opts ...ControllerOption) *EventarcController {
+// The signature is fixed. Adding a variadic parameter here would change the
+// function's type, which breaks any caller that referenced it as a value, and
+// these constructors are in a released API. Use
+// [NewEventarcControllerWithOptions] to pass options.
+func NewEventarcController(sessionService session.Service, agentLoader agent.Loader, memoryService memory.Service, artifactService artifact.Service, pluginConfig runner.PluginConfig, triggerConfig TriggerConfig) *EventarcController {
+	return NewEventarcControllerWithOptions(sessionService, agentLoader, memoryService, artifactService, pluginConfig, triggerConfig)
+}
+
+// NewEventarcControllerWithOptions is [NewEventarcController] with optional settings,
+// such as [WithEventsCompactionConfig].
+func NewEventarcControllerWithOptions(sessionService session.Service, agentLoader agent.Loader, memoryService memory.Service, artifactService artifact.Service, pluginConfig runner.PluginConfig, triggerConfig TriggerConfig, opts ...ControllerOption) *EventarcController {
 	retriable := &RetriableRunner{
 		sessionService:  sessionService,
 		agentLoader:     agentLoader,

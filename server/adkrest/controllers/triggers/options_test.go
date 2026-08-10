@@ -17,24 +17,48 @@ package triggers
 import (
 	"testing"
 
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/artifact"
+	"google.golang.org/adk/v2/memory"
 	"google.golang.org/adk/v2/runner"
+	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/session/compaction"
 )
 
-// TestControllerOptionsAreBackwardCompatible pins that the trigger controller
-// constructors still accept their original argument list. The compaction option
-// was added variadically precisely so existing callers keep compiling; a switch
-// to a required parameter would break this file.
-func TestControllerOptionsAreBackwardCompatible(t *testing.T) {
+// TestControllerConstructorTypesAreUnchanged pins the exported *type* of the
+// trigger constructors, not merely that a call compiles.
+//
+// This is the assertion the previous version of this test was missing. A plain
+// call expression still compiles after a trailing variadic parameter is added,
+// so it cannot catch the one change that actually breaks downstream code:
+// anything that referenced the constructor as a value, or stored it in a field
+// of that function type, stops compiling. Assigning to an explicit function
+// type is what makes the signature part of the contract.
+func TestControllerConstructorTypesAreUnchanged(t *testing.T) {
 	t.Parallel()
 
-	if got := NewPubSubController(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}); got == nil {
-		t.Error("NewPubSubController() with no options returned nil")
+	if got := pubSubCtor(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}); got == nil {
+		t.Error("NewPubSubController() returned nil")
 	}
-	if got := NewEventarcController(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}); got == nil {
-		t.Error("NewEventarcController() with no options returned nil")
+	if got := eventarcCtor(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}); got == nil {
+		t.Error("NewEventarcController() returned nil")
 	}
 }
+
+// The declared types are the assertion: assigning each constructor to an
+// explicit function type fails to compile if its signature changes, including
+// by gaining a trailing variadic parameter, which an ordinary call expression
+// would still accept.
+var (
+	pubSubCtor   NewPubSubControllerFunc   = NewPubSubController
+	eventarcCtor NewEventarcControllerFunc = NewEventarcController
+)
+
+// NewPubSubControllerFunc is the released signature of [NewPubSubController].
+type NewPubSubControllerFunc = func(session.Service, agent.Loader, memory.Service, artifact.Service, runner.PluginConfig, TriggerConfig) *PubSubController
+
+// NewEventarcControllerFunc is the released signature of [NewEventarcController].
+type NewEventarcControllerFunc = func(session.Service, agent.Loader, memory.Service, artifact.Service, runner.PluginConfig, TriggerConfig) *EventarcController
 
 func TestWithEventsCompactionConfig(t *testing.T) {
 	t.Parallel()
@@ -48,11 +72,11 @@ func TestWithEventsCompactionConfig(t *testing.T) {
 	}{
 		{
 			name:   "pubsub",
-			runner: NewPubSubController(nil, nil, nil, nil, runner.PluginConfig{}, tc, WithEventsCompactionConfig(cfg)).runner,
+			runner: NewPubSubControllerWithOptions(nil, nil, nil, nil, runner.PluginConfig{}, tc, WithEventsCompactionConfig(cfg)).runner,
 		},
 		{
 			name:   "eventarc",
-			runner: NewEventarcController(nil, nil, nil, nil, runner.PluginConfig{}, tc, WithEventsCompactionConfig(cfg)).runner,
+			runner: NewEventarcControllerWithOptions(nil, nil, nil, nil, runner.PluginConfig{}, tc, WithEventsCompactionConfig(cfg)).runner,
 		},
 	}
 
@@ -84,15 +108,15 @@ func TestWithEventsCompactionConfigDefaultsToNil(t *testing.T) {
 func TestControllerOptionsToleratesNil(t *testing.T) {
 	t.Parallel()
 
-	if got := NewPubSubController(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil); got == nil {
+	if got := NewPubSubControllerWithOptions(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil); got == nil {
 		t.Error("NewPubSubController() with a nil option returned nil")
 	}
-	if got := NewEventarcController(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil); got == nil {
+	if got := NewEventarcControllerWithOptions(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil); got == nil {
 		t.Error("NewEventarcController() with a nil option returned nil")
 	}
 	// A nil option alongside a real one must not stop the real one applying.
 	cfg := &compaction.Config{CompactionInterval: 2}
-	c := NewPubSubController(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil, WithEventsCompactionConfig(cfg))
+	c := NewPubSubControllerWithOptions(nil, nil, nil, nil, runner.PluginConfig{}, TriggerConfig{MaxConcurrentRuns: 1}, nil, WithEventsCompactionConfig(cfg))
 	if c.runner.eventsCompactionConfig != cfg {
 		t.Error("a nil option prevented a later option from applying")
 	}

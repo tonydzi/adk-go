@@ -112,7 +112,7 @@ func (e *eventarcLauncher) SetupSubrouters(router *mux.Router, config *launcher.
 		MaxConcurrentRuns: e.config.triggerMaxRuns,
 	}
 
-	controller := triggers.NewEventarcController(
+	controller := triggers.NewEventarcControllerWithOptions(
 		config.SessionService,
 		config.AgentLoader,
 		config.MemoryService,

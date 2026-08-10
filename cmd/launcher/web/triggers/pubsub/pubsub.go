@@ -112,7 +112,7 @@ func (p *pubsubLauncher) SetupSubrouters(router *mux.Router, config *launcher.Co
 		MaxConcurrentRuns: p.config.triggerMaxRuns,
 	}
 
-	controller := triggers.NewPubSubController(
+	controller := triggers.NewPubSubControllerWithOptions(
 		config.SessionService,
 		config.AgentLoader,
 		config.MemoryService,

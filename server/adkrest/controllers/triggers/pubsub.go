@@ -36,7 +36,17 @@ type PubSubController struct {
 }
 
 // NewPubSubController creates a new PubSubController.
-func NewPubSubController(sessionService session.Service, agentLoader agent.Loader, memoryService memory.Service, artifactService artifact.Service, pluginConfig runner.PluginConfig, triggerConfig TriggerConfig, opts ...ControllerOption) *PubSubController {
+// The signature is fixed. Adding a variadic parameter here would change the
+// function's type, which breaks any caller that referenced it as a value, and
+// these constructors are in a released API. Use
+// [NewPubSubControllerWithOptions] to pass options.
+func NewPubSubController(sessionService session.Service, agentLoader agent.Loader, memoryService memory.Service, artifactService artifact.Service, pluginConfig runner.PluginConfig, triggerConfig TriggerConfig) *PubSubController {
+	return NewPubSubControllerWithOptions(sessionService, agentLoader, memoryService, artifactService, pluginConfig, triggerConfig)
+}
+
+// NewPubSubControllerWithOptions is [NewPubSubController] with optional settings,
+// such as [WithEventsCompactionConfig].
+func NewPubSubControllerWithOptions(sessionService session.Service, agentLoader agent.Loader, memoryService memory.Service, artifactService artifact.Service, pluginConfig runner.PluginConfig, triggerConfig TriggerConfig, opts ...ControllerOption) *PubSubController {
 	retriable := &RetriableRunner{
 		sessionService:  sessionService,
 		agentLoader:     agentLoader,

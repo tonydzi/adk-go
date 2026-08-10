@@ -77,7 +77,7 @@ func TestNewRuntimeAPIController_PluginsAssignment(t *testing.T) {
 
 	for _, tt := range tc {
 		t.Run(tt.name, func(t *testing.T) {
-			controller := NewRuntimeAPIController(nil, nil, nil, nil, 10*time.Second, runner.PluginConfig{
+			controller := NewRuntimeAPIControllerWithOptions(nil, nil, nil, nil, 10*time.Second, runner.PluginConfig{
 				Plugins: tt.plugins,
 			}, false)
 
@@ -86,7 +86,7 @@ func TestNewRuntimeAPIController_PluginsAssignment(t *testing.T) {
 			}
 
 			if got := len(controller.pluginConfig.Plugins); got != tt.wantPlugins {
-				t.Errorf("NewRuntimeAPIController() plugins count = %v, want %v", got, tt.wantPlugins)
+				t.Errorf("NewRuntimeAPIControllerWithOptions() plugins count = %v, want %v", got, tt.wantPlugins)
 			}
 		})
 	}
@@ -196,7 +196,7 @@ func TestRunSSEHandler(t *testing.T) {
 			}
 
 			// Setup controller
-			controller := NewRuntimeAPIController(
+			controller := NewRuntimeAPIControllerWithOptions(
 				&sessionService,
 				nil,
 				agent.NewSingleLoader(fakeAgent),
@@ -280,9 +280,9 @@ func TestDecodeRequestBody_RejectsUnknownFields(t *testing.T) {
 // variadically precisely so existing callers -- including the three
 // examples/bidi programs -- keep compiling.
 func TestNewRuntimeAPIController_BackwardCompatible(t *testing.T) {
-	c := NewRuntimeAPIController(nil, nil, nil, nil, 10*time.Second, runner.PluginConfig{}, false)
+	c := NewRuntimeAPIControllerWithOptions(nil, nil, nil, nil, 10*time.Second, runner.PluginConfig{}, false)
 	if c == nil {
-		t.Fatal("NewRuntimeAPIController() with no options returned nil")
+		t.Fatal("NewRuntimeAPIControllerWithOptions() with no options returned nil")
 	}
 	if c.eventsCompactionConfig != nil {
 		t.Errorf("eventsCompactionConfig = %v, want nil when the option is not supplied", c.eventsCompactionConfig)
@@ -291,7 +291,7 @@ func TestNewRuntimeAPIController_BackwardCompatible(t *testing.T) {
 
 func TestNewRuntimeAPIController_WithEventsCompactionConfig(t *testing.T) {
 	cfg := &compaction.Config{CompactionInterval: 2}
-	c := NewRuntimeAPIController(nil, nil, nil, nil, 10*time.Second, runner.PluginConfig{}, false,
+	c := NewRuntimeAPIControllerWithOptions(nil, nil, nil, nil, 10*time.Second, runner.PluginConfig{}, false,
 		WithEventsCompactionConfig(cfg))
 	if c.eventsCompactionConfig != cfg {
 		t.Errorf("eventsCompactionConfig = %v, want the config passed to the option", c.eventsCompactionConfig)

@@ -64,7 +64,18 @@ func WithEventsCompactionConfig(cfg *compaction.Config) RuntimeAPIOption {
 }
 
 // NewRuntimeAPIController creates the controller for the Runtime API.
-func NewRuntimeAPIController(sessionService session.Service, memoryService memory.Service, agentLoader agent.Loader, artifactService artifact.Service, sseTimeout time.Duration, pluginConfig runner.PluginConfig, autoCreateSession bool, opts ...RuntimeAPIOption) *RuntimeAPIController {
+//
+// The signature is fixed. Adding a variadic parameter here would change the
+// function's type, which breaks any caller that referenced it as a value even
+// though every ordinary call site still compiles, and these constructors are in
+// a released API. Use [NewRuntimeAPIControllerWithOptions] to pass options.
+func NewRuntimeAPIController(sessionService session.Service, memoryService memory.Service, agentLoader agent.Loader, artifactService artifact.Service, sseTimeout time.Duration, pluginConfig runner.PluginConfig, autoCreateSession bool) *RuntimeAPIController {
+	return NewRuntimeAPIControllerWithOptions(sessionService, memoryService, agentLoader, artifactService, sseTimeout, pluginConfig, autoCreateSession)
+}
+
+// NewRuntimeAPIControllerWithOptions is [NewRuntimeAPIController] with optional
+// settings, such as [WithEventsCompactionConfig].
+func NewRuntimeAPIControllerWithOptions(sessionService session.Service, memoryService memory.Service, agentLoader agent.Loader, artifactService artifact.Service, sseTimeout time.Duration, pluginConfig runner.PluginConfig, autoCreateSession bool, opts ...RuntimeAPIOption) *RuntimeAPIController {
 	c := &RuntimeAPIController{sessionService: sessionService, memoryService: memoryService, agentLoader: agentLoader, artifactService: artifactService, sseTimeout: sseTimeout, pluginConfig: pluginConfig, autoCreateSession: autoCreateSession}
 	for _, opt := range opts {
 		// A nil option is a caller mistake, not a reason to panic during
