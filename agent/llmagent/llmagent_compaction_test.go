@@ -47,12 +47,10 @@ import (
 // The structural properties are therefore asserted here directly and offline,
 // over the prompts the agent actually sent.
 //
-// One property is genuinely not covered. The recorded conversation issues no
-// tool call after the compaction point, so the final prompt carries no function
-// traffic at all and the call-pairing and call-recovery paths are inert against
-// this cassette. Those are covered offline in internal/compactioninternal.
-// Covering them here would need a re-record whose fourth turn calls a tool after
-// the summary exists.
+// The fourth turn calls a tool after the compaction point on purpose, so the
+// prompt it produces carries a summary and function traffic together. Without
+// it the recording never exercises call pairing across a summary, which is the
+// one thing this test is best placed to check.
 //
 // Deliberately not asserted: any particular wording for the summary. It is model
 // output, and pinning it would fail on any model or prompt revision without
@@ -166,14 +164,19 @@ func TestCompactionE2E(t *testing.T) {
 		"What is the weather in Zurich?",
 		"My favourite colour is teal, remember that.",
 		"What was my favourite colour again?",
+		// A tool call after the compaction point, so the prompt that follows it
+		// carries a function call and its response alongside a summary. That is
+		// the arrangement the call-pairing and call-recovery paths exist for,
+		// and without this turn the recording never produces one.
+		"Now check the weather in Oslo.",
 	}
-	var lastAnswer []string
+	answers := make([][]string, len(turns))
 	for i, turn := range turns {
 		answer, err := testutil.CollectTextParts(r.Run(t, sessionID, turn))
 		if err != nil {
 			t.Fatalf("turn %d (%q) failed: %v", i+1, turn, err)
 		}
-		lastAnswer = answer
+		answers[i] = answer
 	}
 
 	// A compaction must have landed. Without this the rest proves nothing.
@@ -188,7 +191,11 @@ func TestCompactionE2E(t *testing.T) {
 		t.Fatalf("no compaction event after %d turns, so this test exercised nothing", len(turns))
 	}
 
-	summaryText := textOf(summaries[len(summaries)-1].Actions.Compaction.CompactedContent)
+	// The first summary, not the last. With four turns the last compaction is
+	// written after the final model call, so it cannot appear in any recorded
+	// prompt; the first one covers the opening turns and is what the later
+	// prompts stand on.
+	summaryText := textOf(summaries[0].Actions.Compaction.CompactedContent)
 	if strings.TrimSpace(summaryText) == "" {
 		t.Error("the stored summary is empty")
 	}
@@ -220,19 +227,49 @@ func TestCompactionE2E(t *testing.T) {
 	}
 
 	// The point of compacting rather than truncating: the fact survives into the
-	// summary and the model can still answer from it. Without this the test
-	// proved the prompt shrank, not that it kept working.
-	answer := strings.ToLower(strings.Join(lastAnswer, " "))
-	if !strings.Contains(answer, "teal") {
-		t.Errorf("the model could not recall the colour from the summary alone; answer was %q", answer)
+	// summary and the model can still answer from it. This is turn 3
+	// specifically, the one that asks, rather than whichever turn happens to be
+	// last. Without it the test proved the prompt shrank, not that it kept
+	// working.
+	recall := strings.ToLower(strings.Join(answers[2], " "))
+	if !strings.Contains(recall, "teal") {
+		t.Errorf("the model could not recall the colour from the summary alone; answer was %q", recall)
 	}
 
 	// Structural checks, asserted here rather than inferred from the fact that a
 	// recorded model once accepted the bytes. Every prompt is checked, not only
 	// the final one.
+	withSummaryAndTools := 0
 	for i, p := range prompts {
 		assertNoOrphanFunctionResponses(t, i, p)
+		if promptHasFunctionTraffic(p) && strings.Contains(promptTextOf(p), strings.TrimSpace(summaryText)) {
+			withSummaryAndTools++
+		}
 	}
+	// At least one prompt must carry a summary and function traffic together.
+	// That is the arrangement call pairing has to survive, and the only one this
+	// test is better placed to check than an offline test is. A re-record whose
+	// conversation stops calling tools after the compaction point would lose it
+	// silently, so it is asserted rather than assumed.
+	if withSummaryAndTools == 0 {
+		t.Error("no recorded prompt carries both a summary and function traffic, so pairing across a summary was never exercised")
+	}
+}
+
+// promptHasFunctionTraffic reports whether contents carry a function call or
+// response.
+func promptHasFunctionTraffic(contents []*genai.Content) bool {
+	for _, c := range contents {
+		if c == nil {
+			continue
+		}
+		for _, part := range c.Parts {
+			if part != nil && (part.FunctionCall != nil || part.FunctionResponse != nil) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // assertNoOrphanFunctionResponses checks that every function response in a
